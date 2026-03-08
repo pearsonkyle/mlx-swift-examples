@@ -9,10 +9,18 @@ supports the following models:
 - [stabilityai/sdxl-turbo](https://huggingface.co/stabilityai/sdxl-turbo)
 - [stabilitiai/stable-diffusion-2-1](https://huggingface.co/stabilityai/stable-diffusion-2-1)
 
+Additionally, **custom SDXL models** can be loaded from local `.safetensors` checkpoint files
+(e.g., models from CivitAI), with support for:
+- **Separate VAE** loading (e.g., `sdxl.vae.safetensors`)
+- **LoRA** weight loading and fusion
+- **360° panorama generation** with seamless X-axis tiling
+
 ## Usage
 
 See [StableDiffusionExample](../../Applications/StableDiffusionExample) and
 [image-tool](../../Tools/image-tool) for examples of using this code.
+
+### Standard Usage (SDXL Turbo)
 
 The basic sequence is:
 
@@ -30,28 +38,77 @@ let generator = try configuration.textToImageGenerator(
 
 generator.ensureLoaded()
 
-// Generate the latents, which are the iterations for generating
-// the output image. This is just generating the evaluation graph
 let parameters = generate.evaluateParameters(configuration: configuration)
 let latents = generator.generateLatents(parameters: parameters)
 
-// evaluate the latents (evalue the graph) and keep the last value generated
 var lastXt: MLXArray?
 for xt in latents {
     eval(xt)
     lastXt = xt
 }
 
-// decode the final latent into an image
 if let lastXt {
     var raster = decoder(lastXt[0])
-    raster = (image * 255).asType(.uint8).squeezed()
+    raster = (raster * 255).asType(.uint8).squeezed()
     eval(raster)
-    
-    // turn it into a CGImage
-    let image = Image(raster).asCGImage()
-    
-    // or write it out
     try Image(raster).save(url: url)
 }
 ```
+
+### Custom Model + LoRA + Panorama
+
+Load a custom SDXL checkpoint from a `.safetensors` file with optional VAE and LoRA:
+
+```swift
+// 1. First download SDXL Turbo (provides tokenizer/scheduler files shared across all SDXL models)
+let sdxlTurbo = StableDiffusionConfiguration.presetSDXLTurbo
+try await sdxlTurbo.download()
+
+// 2. Load custom checkpoint
+let sd = try loadStableDiffusionXLFromSingleFile(
+    url: URL(filePath: "/path/to/dreamshaperXL.safetensors"),
+    vaeUrl: URL(filePath: "/path/to/sdxl.vae.safetensors"),
+    dType: .float16
+)
+
+// 3. Load and fuse LoRA weights
+try loadAndFuseLora(sd, loraUrl: URL(filePath: "/path/to/360Redmond.safetensors"), scale: 1.0)
+
+// 4. Create panorama generator
+let generator = PanoramaGenerator(sd, width: 2048, height: 1024)
+generator.ensureLoaded()
+
+// 5. Generate panorama
+let parameters = PanoramaParameters(
+    prompt: "Glowing mushrooms around pyramids, equirectangular, 360 panorama, cinematic",
+    steps: 8,
+    cfgScale: 3.0
+)
+
+let decoder = generator.detachedDecoder()
+let latents = generator.generateLatents(parameters: parameters)
+
+var lastXt: MLXArray?
+for xt in latents {
+    eval(xt)
+    lastXt = xt
+}
+
+if let lastXt {
+    let decoded = decoder(lastXt)
+    let raster = (decoded * 255).asType(.uint8).squeezed()
+    try Image(raster).save(url: URL(filePath: "/tmp/panorama_360.png"))
+}
+```
+
+### Required Model Files
+
+For custom model loading, you need:
+
+1. **SDXL Turbo** — Downloaded once for tokenizer and scheduler config files (shared architecture)
+2. **Checkpoint** — A `.safetensors` file (e.g., from CivitAI)
+   - [DreamShaper XL Lightning](https://civitai.com/api/download/models/354657)
+3. **VAE** (optional) — A separate `.safetensors` VAE file
+   - [SDXL VAE FP16 Fix](https://huggingface.co/madebyollin/sdxl-vae-fp16-fix)
+4. **LoRA** (optional) — A `.safetensors` LoRA file
+   - [360° Redmond](https://civitai.com/api/download/models/143197)

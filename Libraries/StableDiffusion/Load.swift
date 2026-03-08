@@ -309,6 +309,12 @@ func clipRemap(key: String, value: MLXArray) -> [(String, MLXArray)] {
         return []
     }
 
+    // text_projection is a Linear module in CLIPTextModel, so the raw weight
+    // tensor needs to be mapped to text_projection.weight
+    if key == "text_projection" && value.ndim == 2 {
+        return [("text_projection.weight", value)]
+    }
+
     return [(key, value)]
 }
 
@@ -437,6 +443,495 @@ func loadDiffusionConfiguration(hub: HubApi, configuration: StableDiffusionConfi
         hub: hub, configuration: configuration, key: .diffusionConfig,
         type: DiffusionConfiguration.self)
 }
+
+// MARK: - Single File Loading
+
+/// Local model paths for loading from local .safetensors files
+public struct LocalModelPaths {
+    /// Path to the checkpoint file (.safetensors)
+    public let checkpoint: URL
+    /// Optional path to VAE file (.safetensors)
+    public let vae: URL?
+    /// Optional paths to LoRA files (.safetensors)
+    public let loras: [(url: URL, scale: Float)]
+
+    /// Create local model paths
+    /// - Parameters:
+    ///   - checkpoint: Path to the main checkpoint file
+    ///   - vae: Optional path to VAE file
+    ///   - lora: Optional path to a single LoRA file
+    public init(checkpoint: URL, vae: URL? = nil, lora: URL? = nil) {
+        self.checkpoint = checkpoint
+        self.vae = vae
+        self.loras = lora.map { [($0, Float(1.0))] } ?? []
+    }
+
+    /// Create local model paths with multiple LoRAs
+    /// - Parameters:
+    ///   - checkpoint: Path to the main checkpoint file
+    ///   - vae: Optional path to VAE file
+    ///   - loras: Array of (url, scale) tuples for LoRA weights
+    public init(checkpoint: URL, vae: URL? = nil, loras: [(url: URL, scale: Float)]) {
+        self.checkpoint = checkpoint
+        self.vae = vae
+        self.loras = loras
+    }
+}
+
+// MARK: - LDM to Diffusers Key Conversion
+
+/// Convert a UNet weight key from Stability AI's LDM format to HuggingFace diffusers format.
+///
+/// LDM format uses:
+/// - `input_blocks.X.Y.*` → `down_blocks`/`conv_in`
+/// - `middle_block.X.*` → `mid_block`
+/// - `output_blocks.X.Y.*` → `up_blocks`
+/// - `time_embed.*` → `time_embedding`
+/// - `label_emb.*` → `add_embedding`
+/// - `out.*` → `conv_norm_out`/`conv_out`
+///
+/// - Parameters:
+///   - key: LDM-format weight key (after stripping `model.diffusion_model.` prefix)
+///   - config: UNet configuration to determine block structure
+/// - Returns: Equivalent diffusers-format key
+func ldmUnetToDiffusersKey(_ key: String, config: UNetConfiguration) -> String {
+    // time_embed → time_embedding
+    if key.hasPrefix("time_embed.") {
+        return key
+            .replacingOccurrences(of: "time_embed.0.", with: "time_embedding.linear_1.")
+            .replacingOccurrences(of: "time_embed.2.", with: "time_embedding.linear_2.")
+    }
+
+    // label_emb → add_embedding (SDXL text_time conditioning)
+    if key.hasPrefix("label_emb.") {
+        return key
+            .replacingOccurrences(of: "label_emb.0.0.", with: "add_embedding.linear_1.")
+            .replacingOccurrences(of: "label_emb.0.2.", with: "add_embedding.linear_2.")
+    }
+
+    // out.0 → conv_norm_out, out.2 → conv_out
+    if key.hasPrefix("out.") {
+        return key
+            .replacingOccurrences(of: "out.0.", with: "conv_norm_out.")
+            .replacingOccurrences(of: "out.2.", with: "conv_out.")
+    }
+
+    // input_blocks → conv_in / down_blocks
+    if key.hasPrefix("input_blocks.") {
+        return convertInputBlocks(key, config: config)
+    }
+
+    // middle_block → mid_block
+    if key.hasPrefix("middle_block.") {
+        return key
+            .replacingOccurrences(of: "middle_block.0.", with: "mid_block.resnets.0.")
+            .replacingOccurrences(of: "middle_block.1.", with: "mid_block.attentions.0.")
+            .replacingOccurrences(of: "middle_block.2.", with: "mid_block.resnets.1.")
+    }
+
+    // output_blocks → up_blocks
+    if key.hasPrefix("output_blocks.") {
+        return convertOutputBlocks(key, config: config)
+    }
+
+    return key
+}
+
+/// Convert `input_blocks.X.Y.rest` to diffusers format.
+private func convertInputBlocks(_ key: String, config: UNetConfiguration) -> String {
+    // Parse input_blocks.X.Y.rest
+    let withoutPrefix = String(key.dropFirst("input_blocks.".count))
+    let parts = withoutPrefix.split(separator: ".", maxSplits: 2)
+    guard parts.count >= 2,
+          let blockIdx = Int(parts[0]),
+          let layerIdx = Int(parts[1])
+    else { return key }
+
+    let rest = parts.count > 2 ? "." + parts[2] : ""
+
+    // input_blocks.0.0 → conv_in
+    if blockIdx == 0 && layerIdx == 0 {
+        return "conv_in" + rest
+    }
+
+    // Build mapping from input block index to down_block structure
+    let nBlocks = config.blockOutChannels.count
+    var inputBlockCounter = 1  // start after conv_in at index 0
+
+    for blockI in 0 ..< nBlocks {
+        let hasAttn = config.downBlockTypes[blockI].contains("CrossAttn")
+        let hasDownsample = blockI < nBlocks - 1
+        let nLayers = config.layersPerBlock[blockI]
+
+        for layerJ in 0 ..< nLayers {
+            if blockIdx == inputBlockCounter {
+                if layerIdx == 0 {
+                    return "down_blocks.\(blockI).resnets.\(layerJ)" + rest
+                }
+                if hasAttn && layerIdx == 1 {
+                    return "down_blocks.\(blockI).attentions.\(layerJ)" + rest
+                }
+            }
+            inputBlockCounter += 1
+        }
+
+        if hasDownsample {
+            if blockIdx == inputBlockCounter && layerIdx == 0 {
+                return "down_blocks.\(blockI).downsamplers.0.conv" + rest
+            }
+            inputBlockCounter += 1
+        }
+    }
+
+    return key  // fallback
+}
+
+/// Convert `output_blocks.X.Y.rest` to diffusers format.
+private func convertOutputBlocks(_ key: String, config: UNetConfiguration) -> String {
+    let withoutPrefix = String(key.dropFirst("output_blocks.".count))
+    let parts = withoutPrefix.split(separator: ".", maxSplits: 2)
+    guard parts.count >= 2,
+          let blockIdx = Int(parts[0]),
+          let layerIdx = Int(parts[1])
+    else { return key }
+
+    let rest = parts.count > 2 ? "." + parts[2] : ""
+
+    // Output blocks go from deep to shallow, matching up_blocks order.
+    // up_blocks are built with .reversed() enumeration in UNet.swift,
+    // so up_blocks[0] is the deepest block.
+    let nBlocks = config.blockOutChannels.count
+    var outputBlockCounter = 0
+
+    for blockI in 0 ..< nBlocks {
+        // up_blocks[blockI] corresponds to reversed index
+        let configIdx = nBlocks - 1 - blockI
+        // Check from upBlockTypes (already reversed in config)
+        let upHasAttn = config.upBlockTypes[configIdx].contains("CrossAttn")
+        let hasUpsample = blockI < nBlocks - 1
+        let nLayers = config.layersPerBlock[configIdx] + 1  // up blocks have +1 resnet
+
+        for layerJ in 0 ..< nLayers {
+            if blockIdx == outputBlockCounter {
+                if layerIdx == 0 {
+                    return "up_blocks.\(blockI).resnets.\(layerJ)" + rest
+                }
+                if upHasAttn && layerIdx == 1 {
+                    return "up_blocks.\(blockI).attentions.\(layerJ)" + rest
+                }
+                // Upsample: last layer of the block
+                if hasUpsample && layerJ == nLayers - 1 {
+                    let upsampleLayerIdx = upHasAttn ? 2 : 1
+                    if layerIdx == upsampleLayerIdx {
+                        return "up_blocks.\(blockI).upsamplers.0.conv" + rest
+                    }
+                }
+            }
+            outputBlockCounter += 1
+        }
+    }
+
+    return key  // fallback
+}
+
+/// Remap for single-file UNet: LDM format → diffusers format → MLX format.
+///
+/// Combines `ldmUnetToDiffusersKey` with `unetRemap`.
+func ldmUnetRemap(key: String, value: MLXArray, config: UNetConfiguration) -> [(String, MLXArray)] {
+    let diffusersKey = ldmUnetToDiffusersKey(key, config: config)
+    return unetRemap(key: diffusersKey, value: value)
+}
+
+/// Remap for single-file OpenCLIP text encoder (text encoder 2 in SDXL).
+///
+/// OpenCLIP uses a different structure than standard CLIP:
+/// - `transformer.resblocks.N.attn.in_proj_weight` → split into Q/K/V
+/// - `transformer.resblocks.N.attn.out_proj.*` → attention output
+/// - `transformer.resblocks.N.ln_1.*` → layer_norm1
+/// - `transformer.resblocks.N.ln_2.*` → layer_norm2
+/// - `transformer.resblocks.N.mlp.c_fc.*` → linear1
+/// - `transformer.resblocks.N.mlp.c_proj.*` → linear2
+func openClipRemap(key: String, value: MLXArray) -> [(String, MLXArray)] {
+    var key = key
+
+    // Drop common prefixes
+    if key.hasPrefix("text_model.") {
+        key = String(key.dropFirst("text_model.".count))
+    }
+
+    // Map transformer.resblocks → layers
+    key = key.replacingOccurrences(of: "transformer.resblocks.", with: "layers.")
+
+    // Handle combined in_proj_weight/bias → split into Q, K, V
+    if key.contains("attn.in_proj_weight") {
+        let prefix = key.replacingOccurrences(of: "attn.in_proj_weight", with: "")
+        let dim = value.dim(0) / 3
+        let q = value[0 ..< dim]
+        let k = value[dim ..< (2 * dim)]
+        let v = value[(2 * dim)...]
+        return [
+            (prefix + "attention.query_proj.weight", q),
+            (prefix + "attention.key_proj.weight", k),
+            (prefix + "attention.value_proj.weight", v),
+        ]
+    }
+    if key.contains("attn.in_proj_bias") {
+        let prefix = key.replacingOccurrences(of: "attn.in_proj_bias", with: "")
+        let dim = value.dim(0) / 3
+        let q = value[0 ..< dim]
+        let k = value[dim ..< (2 * dim)]
+        let v = value[(2 * dim)...]
+        return [
+            (prefix + "attention.query_proj.bias", q),
+            (prefix + "attention.key_proj.bias", k),
+            (prefix + "attention.value_proj.bias", v),
+        ]
+    }
+
+    // Map other attention keys
+    key = key.replacingOccurrences(of: "attn.out_proj.", with: "attention.out_proj.")
+
+    // Map layer norms
+    key = key.replacingOccurrences(of: ".ln_1.", with: ".layer_norm1.")
+    key = key.replacingOccurrences(of: ".ln_2.", with: ".layer_norm2.")
+
+    // Map MLP
+    key = key.replacingOccurrences(of: ".mlp.c_fc.", with: ".linear1.")
+    key = key.replacingOccurrences(of: ".mlp.c_proj.", with: ".linear2.")
+
+    // Map final layer norm
+    key = key.replacingOccurrences(of: "ln_final.", with: "final_layer_norm.")
+
+    // Map embeddings
+    key = key.replacingOccurrences(of: "token_embedding.weight", with: "token_embedding.weight")
+    key = key.replacingOccurrences(of: "positional_embedding", with: "position_embedding.weight")
+
+    // Skip position_ids
+    if key == "position_ids" { return [] }
+
+    // text_projection → text_projection.weight
+    if key == "text_projection" && value.ndim == 2 {
+        return [("text_projection.weight", value)]
+    }
+
+    return [(key, value)]
+}
+
+// MARK: - Single-File Key Prefixes
+
+/// Key prefixes for weights in a single-file SDXL checkpoint (Stability AI format).
+///
+/// A single .safetensors SDXL checkpoint contains all model components with these prefixes:
+/// - `model.diffusion_model.*`  → UNet
+/// - `conditioner.embedders.0.transformer.*`  → CLIP text encoder 1
+/// - `conditioner.embedders.1.model.*`  → CLIP text encoder 2
+/// - `first_stage_model.*`  → VAE (encoder + decoder)
+private enum SingleFilePrefix {
+    static let unet = "model.diffusion_model."
+    static let textEncoder1 = "conditioner.embedders.0.transformer."
+    static let textEncoder2 = "conditioner.embedders.1.model."
+    static let vae = "first_stage_model."
+
+    /// Alternative prefixes used by some checkpoint formats
+    static let unetAlt = "unet."
+    static let textEncoder1Alt = "text_encoder."
+    static let textEncoder2Alt = "text_encoder_2."
+}
+
+/// Load Stable Diffusion XL from a single .safetensors checkpoint file.
+///
+/// This function handles the weight key remapping from the single-file format
+/// (used by Stability AI, CivitAI models, etc.) to the MLX model structure.
+///
+/// **Tokenizer and scheduler config**: These are architecture-level files shared across
+/// all SDXL models. This function loads them from the SDXL Turbo preset, which must be
+/// downloaded first (`StableDiffusionConfiguration.presetSDXLTurbo.download()`).
+///
+/// - Parameters:
+///   - url: Path to the .safetensors file containing the full model
+///   - vaeUrl: Optional path to separate VAE .safetensors file
+///   - hub: HubApi instance for tokenizer loading
+///   - configuration: The stable diffusion configuration
+///   - dType: Data type for weights
+/// - Returns: A configured StableDiffusionXL model
+public func loadStableDiffusionXLFromSingleFile(
+    url checkpointUrl: URL,
+    vaeUrl: URL? = nil,
+    hub: HubApi = HubApi(),
+    configuration: StableDiffusionConfiguration = .presetSDXLTurbo,
+    dType: DType = LoadConfiguration().dType
+) throws -> StableDiffusionXL {
+
+    // ──────────────────────────────────────────────
+    // 1. Load all weights from the checkpoint file
+    // ──────────────────────────────────────────────
+    print("Loading checkpoint from \(checkpointUrl.lastPathComponent)...")
+    let allWeights = try loadArrays(url: checkpointUrl)
+
+    // Detect the checkpoint format by looking at key prefixes
+    let hasStabilityFormat = allWeights.keys.contains { $0.hasPrefix(SingleFilePrefix.unet) }
+    let hasDiffusersFormat = allWeights.keys.contains { $0.hasPrefix(SingleFilePrefix.unetAlt) }
+
+    let unetPrefix: String
+    let te1Prefix: String
+    let te2Prefix: String
+    let vaePrefix: String
+
+    if hasStabilityFormat {
+        unetPrefix = SingleFilePrefix.unet
+        te1Prefix = SingleFilePrefix.textEncoder1
+        te2Prefix = SingleFilePrefix.textEncoder2
+        vaePrefix = SingleFilePrefix.vae
+    } else if hasDiffusersFormat {
+        unetPrefix = SingleFilePrefix.unetAlt
+        te1Prefix = SingleFilePrefix.textEncoder1Alt
+        te2Prefix = SingleFilePrefix.textEncoder2Alt
+        vaePrefix = SingleFilePrefix.vae  // same in both formats
+    } else {
+        // Fallback: try Stability format
+        print("Warning: Could not detect checkpoint format. Trying Stability AI format...")
+        unetPrefix = SingleFilePrefix.unet
+        te1Prefix = SingleFilePrefix.textEncoder1
+        te2Prefix = SingleFilePrefix.textEncoder2
+        vaePrefix = SingleFilePrefix.vae
+    }
+
+    // ──────────────────────────────────────────────
+    // 2. Load UNet configuration and weights
+    // ──────────────────────────────────────────────
+    // Use the SDXL Turbo config files as a reference (shared architecture)
+    let sdxlTurbo = StableDiffusionConfiguration.presetSDXLTurbo
+
+    print("Loading UNet configuration...")
+    let unetConfig = try loadConfiguration(
+        hub: hub, configuration: sdxlTurbo, key: .unetConfig, type: UNetConfiguration.self)
+    let unet = UNetModel(configuration: unetConfig)
+
+    // Extract and remap UNet weights
+    print("Loading UNet weights...")
+    let isLDM = hasStabilityFormat
+    let unetWeights: [(String, MLXArray)] = allWeights
+        .filter { $0.key.hasPrefix(unetPrefix) }
+        .flatMap { key, value -> [(String, MLXArray)] in
+            let stripped = String(key.dropFirst(unetPrefix.count))
+            if isLDM {
+                return ldmUnetRemap(key: stripped, value: value.asType(dType), config: unetConfig)
+            } else {
+                return unetRemap(key: stripped, value: value.asType(dType))
+            }
+        }
+    print("  Remapped \(unetWeights.count) UNet weight tensors")
+    try unet.update(parameters: ModuleParameters.unflattened(unetWeights), verify: .none)
+
+    // ──────────────────────────────────────────────
+    // 3. Load Text Encoder 1 (CLIP-L)
+    // ──────────────────────────────────────────────
+    print("Loading text encoder 1...")
+    let te1Config = try loadConfiguration(
+        hub: hub, configuration: sdxlTurbo, key: .textEncoderConfig,
+        type: CLIPTextModelConfiguration.self)
+    let textEncoder1 = CLIPTextModel(configuration: te1Config)
+
+    let te1Weights: [(String, MLXArray)] = allWeights
+        .filter { $0.key.hasPrefix(te1Prefix) }
+        .flatMap { key, value -> [(String, MLXArray)] in
+            let stripped = String(key.dropFirst(te1Prefix.count))
+            return clipRemap(key: stripped, value: value.asType(dType))
+        }
+    try textEncoder1.update(parameters: ModuleParameters.unflattened(te1Weights), verify: .none)
+
+    // ──────────────────────────────────────────────
+    // 4. Load Text Encoder 2 (CLIP-G / OpenCLIP)
+    // ──────────────────────────────────────────────
+    print("Loading text encoder 2...")
+    let te2Config = try loadConfiguration(
+        hub: hub, configuration: sdxlTurbo, key: .textEncoderConfig2,
+        type: CLIPTextModelConfiguration.self)
+    let textEncoder2 = CLIPTextModel(configuration: te2Config)
+
+    let te2Weights: [(String, MLXArray)] = allWeights
+        .filter { $0.key.hasPrefix(te2Prefix) }
+        .flatMap { key, value -> [(String, MLXArray)] in
+            let stripped = String(key.dropFirst(te2Prefix.count))
+            if isLDM {
+                // OpenCLIP format: combined in_proj, resblocks, etc.
+                return openClipRemap(key: stripped, value: value.asType(dType))
+            } else {
+                return clipRemap(key: stripped, value: value.asType(dType))
+            }
+        }
+    print("  Remapped \(te2Weights.count) text encoder 2 weight tensors")
+    try textEncoder2.update(parameters: ModuleParameters.unflattened(te2Weights), verify: .none)
+
+    // ──────────────────────────────────────────────
+    // 5. Load VAE
+    // ──────────────────────────────────────────────
+    print("Loading VAE...")
+    let autoencoderConfig = AutoencoderConfiguration()
+    let autoencoder = Autoencoder(configuration: autoencoderConfig)
+
+    if let vaeUrl {
+        // Load from separate VAE file (e.g., sdxl.vae.safetensors)
+        print("Using separate VAE file: \(vaeUrl.lastPathComponent)")
+        try loadWeights(url: vaeUrl, model: autoencoder, mapper: vaeRemap, dType: .float32)
+    } else {
+        // Extract VAE weights from the checkpoint
+        let vaeWeights: [(String, MLXArray)] = allWeights
+            .filter { $0.key.hasPrefix(vaePrefix) }
+            .flatMap { key, value -> [(String, MLXArray)] in
+                let stripped = String(key.dropFirst(vaePrefix.count))
+                return vaeRemap(key: stripped, value: value.asType(.float32))
+            }
+        try autoencoder.update(
+            parameters: ModuleParameters.unflattened(vaeWeights), verify: .none)
+    }
+
+    // ──────────────────────────────────────────────
+    // 6. Load diffusion config and sampler
+    // ──────────────────────────────────────────────
+    print("Loading scheduler configuration...")
+    let diffusionConfig = try loadDiffusionConfiguration(hub: hub, configuration: sdxlTurbo)
+    let sampler = SimpleEulerAncestralSampler(configuration: diffusionConfig)
+
+    // ──────────────────────────────────────────────
+    // 7. Load tokenizers (shared across all SDXL models)
+    // ──────────────────────────────────────────────
+    print("Loading tokenizers...")
+    let tokenizer1 = try loadTokenizer(hub: hub, configuration: sdxlTurbo)
+    let tokenizer2 = try loadTokenizer(
+        hub: hub, configuration: sdxlTurbo,
+        vocabulary: .tokenizerVocabulary2, merges: .tokenizerMerges2)
+
+    // ──────────────────────────────────────────────
+    // 8. Assemble the model
+    // ──────────────────────────────────────────────
+    print("Assembling StableDiffusionXL model...")
+    let model = try StableDiffusionXL(
+        hub: hub, configuration: configuration, dType: dType,
+        diffusionConfiguration: diffusionConfig,
+        unet: unet,
+        textEncoder: textEncoder1,
+        autoencoder: autoencoder,
+        sampler: sampler,
+        tokenizer: tokenizer1,
+        textEncoder2: textEncoder2,
+        tokenizer2: tokenizer2
+    )
+
+    print("Model loaded successfully!")
+    return model
+}
+
+/// Load and fuse LoRA weights from a .safetensors file into a StableDiffusion model.
+///
+/// This is a convenience wrapper that loads LoRA weights and fuses them into the model.
+/// See ``Lora.swift`` for the implementation details.
+///
+/// - Parameters:
+///   - sd: The StableDiffusion model to fuse LoRA into
+///   - loraUrl: Path to the .safetensors file containing LoRA weights
+///   - scale: Scale factor for LoRA weights (default 1.0)
+// loadAndFuseLora is defined in Lora.swift
 
 // MARK: - Tokenizer
 

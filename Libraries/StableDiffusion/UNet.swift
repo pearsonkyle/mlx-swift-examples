@@ -156,12 +156,12 @@ class Transformer2D: Module {
 class ResnetBlock2D: Module {
 
     let norm1: GroupNorm
-    let conv1: Conv2d
+    @ModuleInfo var conv1: Conv2d
 
     @ModuleInfo(key: "time_emb_proj") var timeEmbedProjection: Linear?
 
     let norm2: GroupNorm
-    let conv2: Conv2d
+    @ModuleInfo var conv2: Conv2d
 
     @ModuleInfo(key: "conv_shortcut") var convolutionShortcut: Linear?
 
@@ -220,8 +220,8 @@ class UNetBlock2D: Module {
 
     let resnets: [ResnetBlock2D]
     let attentions: [Transformer2D]?
-    let downsample: Conv2d?
-    let upsample: Conv2d?
+    @ModuleInfo var downsample: Conv2d?
+    @ModuleInfo var upsample: Conv2d?
 
     init(
         inputChannels: Int, outputChannels: Int, timeEmbedChannels: Int,
