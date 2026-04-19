@@ -4,7 +4,9 @@ import MLX
 import StableDiffusion
 import SwiftUI
 import UniformTypeIdentifiers
-
+#if !os(macOS)
+import UIKit
+#endif
 // MARK: - Model Source
 
 /// Selects between the default SDXL Turbo preset and a custom local model.
@@ -24,6 +26,9 @@ struct ContentView: View {
     // Local model file path (single merged checkpoint with LoRA baked in)
     @State var modelSource: ModelSource = .sdxlTurbo
     @State var checkpointPath: String = ""
+    #if !os(macOS)
+    @State var documentPickerDelegate: DocumentPickerDelegate?
+    #endif
 
     // Panorama parameters
     @State var outputWidth: String = "2048"
@@ -163,6 +168,7 @@ struct ContentView: View {
                     .textFieldStyle(.roundedBorder)
                 #endif
             Button("Browse") {
+                #if os(macOS)
                 let panel = NSOpenPanel()
                 panel.allowedContentTypes = types.compactMap { UTType(filenameExtension: $0) }
                 panel.canChooseDirectories = false
@@ -170,11 +176,47 @@ struct ContentView: View {
                 if panel.runModal() == .OK, let url = panel.url {
                     path.wrappedValue = url.path(percentEncoded: false)
                 }
+                #else
+                let delegate = DocumentPickerDelegate(
+                    onFileSelected: { url in
+                        path.wrappedValue = url.path(percentEncoded: false)
+                    }
+                )
+                documentPickerDelegate = delegate
+
+                let documentPicker = UIDocumentPickerViewController(
+                    forOpeningContentTypes: types.compactMap { UTType(filenameExtension: $0) },
+                    asCopy: true
+                )
+                documentPicker.allowsMultipleSelection = false
+                documentPicker.directoryURL = URL(filePath: path.wrappedValue)
+                documentPicker.delegate = delegate
+
+                if let windowScene = UIApplication.shared.connectedScenes
+                    .compactMap({ $0 as? UIWindowScene }).first,
+                   let rootVC = windowScene.keyWindow?.rootViewController {
+                    rootVC.present(documentPicker, animated: true)
+                }
+                #endif
             }
             .font(.caption)
         }
     }
 
+    // Document picker delegate for iOS/visionOS
+    class DocumentPickerDelegate: NSObject, UIDocumentPickerDelegate {
+        private let onFileSelected: (URL) -> Void
+        
+        init(onFileSelected: @escaping (URL) -> Void) {
+            self.onFileSelected = onFileSelected
+        }
+        
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            if let url = urls.first {
+                onFileSelected(url)
+            }
+        }
+    }
     // MARK: - Generation
 
     private func generate() {

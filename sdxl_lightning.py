@@ -34,7 +34,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # Local model files (expected in same directory as this script)
 CHECKPOINT_PATH = SCRIPT_DIR / "dreamshaperXL_lightningDPMSDE.safetensors"
 LORA_PATH       = SCRIPT_DIR / "360RedmondResized.safetensors"
-LORA_DETAILS_PATH = SCRIPT_DIR / "more_details.safetensors"
+LORA_DETAILS_PATH = SCRIPT_DIR / "SDXLFaeTastic2400.safetensors"
 VAE_PATH        = SCRIPT_DIR / "sdxl.vae.safetensors"
 
 # Generation parameters (from the ComfyUI workflow)
@@ -120,16 +120,20 @@ vae = AutoencoderKL.from_single_file(
 )
 pipe.vae = vae
 
-# Load LoRA from local file
-print(f"Loading LoRA from {LORA_PATH} ...")
-pipe.load_lora_weights(str(LORA_PATH))
+# Load LoRAs with individual scales
+print(f"Loading main 360° LoRA from {LORA_PATH} (scale=1.0) ...")
+pipe.load_lora_weights(str(LORA_PATH), adapter_name="main_lora")
 
-# if LORA_DETAILS_PATH.exists():
-#     print(f"Loading additional LoRA from {LORA_DETAILS_PATH} ...")
-#     pipe.load_lora_weights(str(LORA_DETAILS_PATH))
+if LORA_DETAILS_PATH.exists():
+    print(f"Loading details LoRA from {LORA_DETAILS_PATH} (scale=0.1) ...")
+    pipe.load_lora_weights(str(LORA_DETAILS_PATH), adapter_name="details_lora")
+else:
+    print("⚠️ Details LoRA file not found — skipping.")
 
-# Fuse *all* loaded LoRAs (default scale=1.0 per LoRA)
-pipe.fuse_lora(lora_scale=1.0)
+print("Fusing LoRAs with correct per-adapter scales...")
+pipe.fuse_lora(adapter_names=["main_lora"], lora_scale=1.0)
+if LORA_DETAILS_PATH.exists():
+    pipe.fuse_lora(adapter_names=["details_lora"], lora_scale=0.5)
 
 # Move to GPU
 pipe = pipe.to(DEVICE)
@@ -234,3 +238,4 @@ print(f'  let sd = try loadStableDiffusionXLFromSingleFile(')
 print(f'      url: URL(filePath: "{merged_path}"),')
 print(f'      dType: .float16')
 print(f'  )')
+
