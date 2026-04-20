@@ -11,80 +11,184 @@ struct ContentView: View {
     @State var evaluator = StableDiffusionEvaluator()
     @State var showProgress = false
 
+    // Panorama crop controls
+    @State var fovDeg: Double = 90
+    @State var showPanoramaViews = false
+    @State var panoramaViews: FourViews?
+    @State var isCropping = false
+
     var body: some View {
-        VStack {
-            HStack {
-                if let progress = evaluator.progress {
-                    ProgressView(progress.title, value: progress.current, total: progress.limit)
-                }
-            }
-            .frame(height: 20)
-
-            Spacer()
-            if let image = evaluator.image {
-                Image(image, scale: 1.0, label: Text(""))
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(minHeight: 200)
-            }
-            Spacer()
-
-            Grid {
-                GridRow {
-                    TextField("prompt", text: $prompt)
-                        .onSubmit(generate)
-                        .disabled(evaluator.progress != nil)
-                        #if os(visionOS)
-                            .textFieldStyle(.roundedBorder)
-                        #endif
-
-                    Button(action: { prompt = "" }) {
-                        Label("clear", systemImage: "xmark.circle.fill").font(.system(size: 10))
+        ScrollView {
+            VStack {
+                HStack {
+                    if let progress = evaluator.progress {
+                        ProgressView(progress.title, value: progress.current, total: progress.limit)
                     }
-                    .labelStyle(.iconOnly)
-                    .buttonStyle(.plain)
-
-                    Button("generate", action: generate)
-                        .disabled(evaluator.progress != nil)
-                        .keyboardShortcut("r")
                 }
-                if evaluator.modelFactory.canShowProgress
-                    || evaluator.modelFactory.canUseNegativeText
-                {
+                .frame(height: 20)
+
+                Spacer()
+                if let image = evaluator.image {
+                    Image(image, scale: 1.0, label: Text(""))
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(minHeight: 200)
+                }
+                Spacer()
+
+                Grid {
                     GridRow {
-                        if evaluator.modelFactory.canUseNegativeText {
-                            TextField("negative prompt", text: $negativePrompt)
-                                .onSubmit(generate)
-                                .disabled(evaluator.progress != nil)
-                                #if os(visionOS)
-                                    .textFieldStyle(.roundedBorder)
-                                #endif
-                            Button(action: { prompt = "" }) {
-                                Label("clear", systemImage: "xmark.circle.fill").font(
-                                    .system(size: 10))
-                            }
-                            .labelStyle(.iconOnly)
-                            .buttonStyle(.plain)
-                        } else {
-                            EmptyView()
-                            EmptyView()
-                        }
+                        TextField("prompt", text: $prompt)
+                            .onSubmit(generate)
+                            .disabled(evaluator.progress != nil)
+                            #if os(visionOS)
+                                .textFieldStyle(.roundedBorder)
+                            #endif
 
-                        if evaluator.modelFactory.canShowProgress {
-                            Toggle("Show Progress", isOn: $showProgress)
+                        Button(action: { prompt = "" }) {
+                            Label("clear", systemImage: "xmark.circle.fill").font(
+                                .system(size: 10))
+                        }
+                        .labelStyle(.iconOnly)
+                        .buttonStyle(.plain)
+
+                        Button("generate", action: generate)
+                            .disabled(evaluator.progress != nil)
+                            .keyboardShortcut("r")
+                    }
+                    if evaluator.modelFactory.canShowProgress
+                        || evaluator.modelFactory.canUseNegativeText
+                    {
+                        GridRow {
+                            if evaluator.modelFactory.canUseNegativeText {
+                                TextField("negative prompt", text: $negativePrompt)
+                                    .onSubmit(generate)
+                                    .disabled(evaluator.progress != nil)
+                                    #if os(visionOS)
+                                        .textFieldStyle(.roundedBorder)
+                                    #endif
+                                Button(action: { prompt = "" }) {
+                                    Label("clear", systemImage: "xmark.circle.fill").font(
+                                        .system(size: 10))
+                                }
+                                .labelStyle(.iconOnly)
+                                .buttonStyle(.plain)
+                            } else {
+                                EmptyView()
+                                EmptyView()
+                            }
+
+                            if evaluator.modelFactory.canShowProgress {
+                                Toggle("Show Progress", isOn: $showProgress)
+                            }
                         }
                     }
                 }
+                .frame(minWidth: 300)
+
+                // Panorama crop controls
+                if evaluator.image != nil {
+                    panoramaCropSection
+                }
             }
-            .frame(minWidth: 300)
+            .padding()
         }
-        .padding()
     }
 
+    // MARK: - Panorama Crop Section
+
+    private var panoramaCropSection: some View {
+        VStack(spacing: 12) {
+            Divider()
+                .padding(.vertical, 4)
+
+            Text("360° Panorama Crop")
+                .font(.headline)
+
+            HStack {
+                Text("FOV: \(Int(fovDeg))°")
+                    .frame(width: 80, alignment: .leading)
+                Slider(value: $fovDeg, in: 30...150, step: 1) {
+                    Text("FOV")
+                }
+            }
+
+            HStack {
+                Button(action: cropPanorama) {
+                    if isCropping {
+                        ProgressView()
+                            .controlSize(.small)
+                            .padding(.trailing, 4)
+                        Text("Cropping…")
+                    } else {
+                        Label("Crop 4 Views", systemImage: "rectangle.split.2x2")
+                    }
+                }
+                .disabled(isCropping || evaluator.image == nil)
+
+                if panoramaViews != nil {
+                    Button(action: { showPanoramaViews.toggle() }) {
+                        Label(
+                            showPanoramaViews ? "Hide Views" : "Show Views",
+                            systemImage: showPanoramaViews
+                                ? "eye.slash" : "eye"
+                        )
+                    }
+                }
+            }
+
+            if showPanoramaViews, let views = panoramaViews {
+                panoramaGrid(views)
+            }
+        }
+    }
+
+    private func panoramaGrid(_ views: FourViews) -> some View {
+        let labels = ["Front (0°)", "Right (90°)", "Back (180°)", "Left (270°)"]
+        let images = [views.front, views.right, views.back, views.left]
+
+        return LazyVGrid(
+            columns: [GridItem(.flexible()), GridItem(.flexible())],
+            spacing: 8
+        ) {
+            ForEach(0..<4, id: \.self) { i in
+                VStack(spacing: 4) {
+                    Image(images[i], scale: 1.0, label: Text(labels[i]))
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .cornerRadius(8)
+                    Text(labels[i])
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(.top, 8)
+    }
+
+    // MARK: - Actions
+
     private func generate() {
+        // Reset panorama views when generating a new image
+        panoramaViews = nil
+        showPanoramaViews = false
         Task {
             await evaluator.generate(
                 prompt: prompt, negativePrompt: negativePrompt, showProgress: showProgress)
+        }
+    }
+
+    private func cropPanorama() {
+        guard let sourceImage = evaluator.image else { return }
+        isCropping = true
+        Task.detached {
+            let views = extractFourViews(
+                from: sourceImage, fovDeg: Float(fovDeg), outputSize: 512)
+            await MainActor.run {
+                panoramaViews = views
+                showPanoramaViews = true
+                isCropping = false
+            }
         }
     }
 }
