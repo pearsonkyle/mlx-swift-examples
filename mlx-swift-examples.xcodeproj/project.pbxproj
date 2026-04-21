@@ -343,6 +343,7 @@
 			membershipExceptions = (
 				StableDiffusionExample/Assets.xcassets,
 				StableDiffusionExample/ContentView.swift,
+				StableDiffusionExample/Equi2Pers.swift,
 				"StableDiffusionExample/Preview Content/Preview Assets.xcassets",
 				StableDiffusionExample/StableDiffusionExampleApp.swift,
 			);

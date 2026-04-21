@@ -1,5 +1,6 @@
 // Copyright © 2024 Apple Inc.
 
+import ImageIO
 import MLX
 import StableDiffusion
 import SwiftUI
@@ -37,6 +38,14 @@ struct ContentView: View {
     @State var cfgScale: String = "3.0"
     @State var seed: String = ""
 
+    // Equirectangular crop parameters
+    @State var numCrops: String = "4"
+    @State var cropFovDeg: String = "90"
+    #if !os(macOS)
+    @State var cropShareItems: [Any] = []
+    @State var showCropShareSheet = false
+    #endif
+
     var body: some View {
         VStack {
             HStack {
@@ -54,6 +63,10 @@ struct ContentView: View {
                     .frame(minHeight: 200)
             }
             Spacer()
+
+            if evaluator.image != nil {
+                cropControlsSection
+            }
 
             // Model Source Picker
             Picker("Model", selection: $modelSource) {
@@ -144,6 +157,39 @@ struct ContentView: View {
             }
         }
         .padding()
+    }
+
+    // MARK: - Equirectangular Crop Controls
+
+    @ViewBuilder
+    var cropControlsSection: some View {
+        HStack(spacing: 12) {
+            Text("Crops:")
+                .foregroundStyle(.secondary)
+            TextField("4", text: $numCrops)
+                .frame(width: 36)
+                #if os(visionOS)
+                    .textFieldStyle(.roundedBorder)
+                #endif
+            Text("FOV:")
+                .foregroundStyle(.secondary)
+            TextField("90", text: $cropFovDeg)
+                .frame(width: 46)
+                #if os(visionOS)
+                    .textFieldStyle(.roundedBorder)
+                #endif
+            Text("°")
+                .foregroundStyle(.secondary)
+            Button("Extract & Save Crops", action: extractAndSaveCrops)
+                .disabled(evaluator.progress != nil)
+        }
+        .font(.caption)
+        .padding(.horizontal)
+        #if !os(macOS)
+        .sheet(isPresented: $showCropShareSheet) {
+            ActivityView(activityItems: cropShareItems)
+        }
+        #endif
     }
 
     // MARK: - Local Model File Selection
@@ -249,7 +295,70 @@ struct ContentView: View {
             }
         }
     }
+
+    // MARK: - Equirectangular Crop Extraction
+
+    private func extractAndSaveCrops() {
+        guard let image = evaluator.image else { return }
+        let cropCount = Int(numCrops) ?? 4
+        let fov = Float(cropFovDeg) ?? 90.0
+        let cropSize = min(image.height, 512)
+
+        let crops = extractEvenlySpacedCrops(
+            from: image, numCrops: cropCount, fovDeg: fov, outputSize: cropSize)
+        guard !crops.isEmpty else { return }
+
+        #if os(macOS)
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Save Crops Here"
+        panel.message = "Choose a folder to save the \(crops.count) perspective crop(s)."
+        guard panel.runModal() == .OK, let dir = panel.url else { return }
+
+        for (yaw, crop) in crops {
+            let filename = String(format: "crop_yaw%03.0f.png", yaw)
+            let url = dir.appendingPathComponent(filename)
+            guard
+                let dest = CGImageDestinationCreateWithURL(
+                    url as CFURL, UTType.png.identifier as CFString, 1, nil)
+            else { continue }
+            CGImageDestinationAddImage(dest, crop, nil)
+            CGImageDestinationFinalize(dest)
+        }
+        #else
+        // Build PNG data items for the share sheet
+        var items: [Any] = []
+        for (yaw, crop) in crops {
+            let filename = String(format: "crop_yaw%03.0f.png", yaw)
+            let tmpURL = FileManager.default.temporaryDirectory.appendingPathComponent(filename)
+            if let dest = CGImageDestinationCreateWithURL(
+                tmpURL as CFURL, UTType.png.identifier as CFString, 1, nil)
+            {
+                CGImageDestinationAddImage(dest, crop, nil)
+                CGImageDestinationFinalize(dest)
+                items.append(tmpURL)
+            }
+        }
+        cropShareItems = items
+        showCropShareSheet = true
+        #endif
+    }
 }
+
+#if !os(macOS)
+/// UIActivityViewController wrapper for SwiftUI
+private struct ActivityView: UIViewControllerRepresentable {
+    let activityItems: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
+}
+#endif
 
 /// Progress reporting with a title.
 struct Progress: Equatable {
