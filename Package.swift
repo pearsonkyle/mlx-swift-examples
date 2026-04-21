@@ -1,11 +1,11 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 6.0
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import PackageDescription
 
 let package = Package(
     name: "mlx-libraries",
-    platforms: [.macOS("15.0"), .iOS("18.0"), .visionOS("2.0")],
+    platforms: [.macOS(.v15), .iOS(.v18), .visionOS(.v2)],
     products: [
         .library(
             name: "MLXMNIST",
