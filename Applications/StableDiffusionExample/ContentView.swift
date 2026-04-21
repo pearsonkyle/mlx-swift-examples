@@ -38,13 +38,50 @@ struct ContentView: View {
     @State var seed: String = ""
 
     var body: some View {
+        TabView {
+            generationTab
+                .tabItem {
+                    Label("Generate", systemImage: "wand.and.stars")
+                }
+            CroppedImagesView(panoramaImage: evaluator.image)
+                .tabItem {
+                    Label("Gaussian Splat", systemImage: "cube.transparent")
+                }
+        }
+    }
+
+    var generationTab: some View {
         VStack {
-            HStack {
+            VStack(spacing: 4) {
                 if let progress = evaluator.progress {
-                    ProgressView(progress.title, value: progress.current, total: progress.limit)
+                    if progress.isIndeterminate {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text(progress.title)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } else {
+                        ProgressView(value: progress.current, total: progress.limit) {
+                            HStack {
+                                Text(progress.title)
+                                    .font(.caption)
+                                Spacer()
+                                Text("\(Int(progress.current))/\(Int(progress.limit))")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    if let detail = progress.detail {
+                        Text(detail)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
-            .frame(height: 20)
+            .frame(height: 40)
 
             Spacer()
             if let image = evaluator.image {
@@ -251,11 +288,23 @@ struct ContentView: View {
     }
 }
 
-/// Progress reporting with a title.
+/// Progress reporting with a title, elapsed time, and optional indeterminate mode.
 struct Progress: Equatable {
     let title: String
     let current: Double
     let limit: Double
+    /// When true, shows an indeterminate (animated) indicator instead of a bar
+    let isIndeterminate: Bool
+    /// Detail text shown below the title (e.g. "Step 3/8 — 12.4s per step")
+    let detail: String?
+
+    init(title: String, current: Double, limit: Double, isIndeterminate: Bool = false, detail: String? = nil) {
+        self.title = title
+        self.current = current
+        self.limit = limit
+        self.isIndeterminate = isIndeterminate
+        self.detail = detail
+    }
 }
 
 /// Async model factory
@@ -486,8 +535,10 @@ class StableDiffusionEvaluator {
         cfgScale: Float,
         seed: UInt64?
     ) async {
-        progress = .init(title: "Preparing local model...", current: 0, limit: 1)
+        progress = .init(title: "Preparing local model...", current: 0, limit: 1, isIndeterminate: true)
         message = nil
+
+        let overallStart = CFAbsoluteTimeGetCurrent()
 
         do {
             // Validate checkpoint path
@@ -500,7 +551,13 @@ class StableDiffusionEvaluator {
             let checkpointUrl = URL(filePath: checkpointPath)
 
             // Step 1: Ensure SDXL Turbo is downloaded (for tokenizer/scheduler files)
-            progress = .init(title: "Downloading SDXL Turbo tokenizer files...", current: 0, limit: 100)
+            updateProgress(
+                progress: .init(
+                    title: "Downloading tokenizer files",
+                    current: 0, limit: 100,
+                    detail: "Required for SDXL tokenizer and scheduler"
+                )
+            )
             let sdxlTurbo = StableDiffusionConfiguration.presetSDXLTurbo
             let progressCallback: @Sendable (Foundation.Progress) -> Void = { [weak self] dlProgress in
                 if dlProgress.fractionCompleted < 0.99 {
@@ -508,7 +565,8 @@ class StableDiffusionEvaluator {
                         progress: .init(
                             title: "Downloading tokenizer files",
                             current: dlProgress.fractionCompleted * 100,
-                            limit: 100
+                            limit: 100,
+                            detail: String(format: "%.0f%% complete", dlProgress.fractionCompleted * 100)
                         )
                     )
                 }
@@ -516,17 +574,37 @@ class StableDiffusionEvaluator {
             try await sdxlTurbo.download(progressHandler: progressCallback)
 
             // Step 2: Load the merged checkpoint (VAE + LoRA already baked in)
-            updateProgress(progress: .init(title: "Loading merged checkpoint...", current: 0, limit: 1))
+            let loadStart = CFAbsoluteTimeGetCurrent()
+            updateProgress(
+                progress: .init(
+                    title: "Loading checkpoint",
+                    current: 0, limit: 1,
+                    isIndeterminate: true,
+                    detail: "Parsing \(checkpointUrl.lastPathComponent)..."
+                )
+            )
 
             let sd = try loadStableDiffusionXLFromSingleFile(
                 url: checkpointUrl,
                 dType: LoadConfiguration().dType
             )
 
-            // Step 3: Create panorama generator
-            updateProgress(progress: .init(title: "Loading model weights...", current: 0, limit: 1))
+            let loadElapsed = CFAbsoluteTimeGetCurrent() - loadStart
+
+            // Step 3: Create panorama generator and load weights into GPU
+            let weightsStart = CFAbsoluteTimeGetCurrent()
+            updateProgress(
+                progress: .init(
+                    title: "Loading model weights",
+                    current: 0, limit: 1,
+                    isIndeterminate: true,
+                    detail: String(format: "Checkpoint loaded in %.1fs — transferring weights to GPU...", loadElapsed)
+                )
+            )
             let generator = PanoramaGenerator(sd, width: width, height: height)
             generator.ensureLoaded()
+
+            let weightsElapsed = CFAbsoluteTimeGetCurrent() - weightsStart
 
             // Step 4: Generate panorama
             let parameters = PanoramaParameters(
@@ -542,25 +620,70 @@ class StableDiffusionEvaluator {
             let decoder = generator.detachedDecoder()
             let latents = generator.generateLatents(parameters: parameters)
 
+            updateProgress(
+                progress: .init(
+                    title: "Denoising",
+                    current: 0, limit: Double(steps),
+                    detail: String(format: "Weights loaded in %.1fs — starting denoising (%d×%d, %d steps)...", weightsElapsed, width, height, steps)
+                )
+            )
+
             var lastXt: MLXArray?
+            var stepTimes: [Double] = []
             for (i, xt) in latents.enumerated() {
+                let stepStart = CFAbsoluteTimeGetCurrent()
                 lastXt = nil
                 eval(xt)
                 lastXt = xt
 
+                let stepElapsed = CFAbsoluteTimeGetCurrent() - stepStart
+                stepTimes.append(stepElapsed)
+
+                let avgStepTime = stepTimes.reduce(0, +) / Double(stepTimes.count)
+                let remainingSteps = steps - (i + 1)
+                let eta = avgStepTime * Double(remainingSteps)
+
+                let detail: String
+                if remainingSteps > 0 {
+                    detail = String(format: "Step %d/%d (%.1fs) — ~%.0fs remaining", i + 1, steps, stepElapsed, eta)
+                } else {
+                    let totalDenoise = stepTimes.reduce(0, +)
+                    detail = String(format: "Step %d/%d (%.1fs) — denoising done in %.1fs", i + 1, steps, stepElapsed, totalDenoise)
+                }
+
                 updateProgress(
                     progress: .init(
-                        title: "Generating panorama",
+                        title: "Denoising",
                         current: Double(i + 1),
-                        limit: Double(steps)
+                        limit: Double(steps),
+                        detail: detail
                     )
                 )
             }
 
             // Step 5: Decode and display
             if let lastXt {
-                updateProgress(progress: .init(title: "Decoding image...", current: 0, limit: 1))
+                let decodeStart = CFAbsoluteTimeGetCurrent()
+                updateProgress(
+                    progress: .init(
+                        title: "Decoding image",
+                        current: 0, limit: 1,
+                        isIndeterminate: true,
+                        detail: "Running VAE decoder..."
+                    )
+                )
                 display(decoded: decoder(lastXt))
+                let decodeElapsed = CFAbsoluteTimeGetCurrent() - decodeStart
+                let totalElapsed = CFAbsoluteTimeGetCurrent() - overallStart
+                updateProgress(
+                    progress: .init(
+                        title: "Complete",
+                        current: 1, limit: 1,
+                        detail: String(format: "Decoded in %.1fs — total time %.1fs", decodeElapsed, totalElapsed)
+                    )
+                )
+                // Brief pause so the user can see the completion message
+                try await Task.sleep(for: .seconds(1.5))
             }
 
             updateProgress(progress: nil)

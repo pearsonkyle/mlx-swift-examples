@@ -1,18 +1,18 @@
 //
-//  SHARPModelRunner.swift
+//  Sharp.swift
 //  SHARP Model Inference and PLY Export
 //
-//  Loads a SHARP Core ML model, runs inference on an image,
+//  Loads a SHARP Core ML model, runs inference on a CGImage,
 //  and saves the 3D Gaussian splat output as a PLY file.
-// 
-//  Usage:
-//    swiftc -O -o sharp_runner sharp.swift -framework CoreML -framework CoreImage -framework AppKit
-//    ./sharp_runner sharp.mlpackage test.png output.ply -d 0.5
 
-import Foundation
-import CoreML
 import CoreImage
-import AppKit  // For NSImage on macOS; use UIKit for iOS
+import CoreML
+import Foundation
+#if os(macOS)
+    import AppKit
+#else
+    import UIKit
+#endif
 
 // MARK: - Gaussians3D Structure
 
@@ -105,11 +105,14 @@ func inverseSigmoid(_ x: Float) -> Float {
 
 // MARK: - SHARP Model Wrapper
 
-class SHARPModelRunner {
+/// Runner for the SHARP Core ML model. Instances are not shared across concurrent tasks;
+/// each `Task.detached` in ``GaussianSplatEvaluator`` creates its own runner, so
+/// `@unchecked Sendable` is safe here.
+final class SHARPModelRunner: @unchecked Sendable {
     private let model: MLModel
-    private let inputHeight: Int
-    private let inputWidth: Int
-    
+    let inputHeight: Int
+    let inputWidth: Int
+
     init(modelPath: URL, inputHeight: Int = 1536, inputWidth: Int = 1536) throws {
         let config = MLModelConfiguration()
         config.computeUnits = .all
@@ -185,79 +188,100 @@ class SHARPModelRunner {
         return compiledPath
     }
     
-    /// Load and preprocess an image for model input
-    func preprocessImage(at imagePath: URL) throws -> MLMultiArray {
-        guard let nsImage = NSImage(contentsOf: imagePath) else {
-            throw NSError(domain: "SHARPModelRunner", code: 1,
-                         userInfo: [NSLocalizedDescriptionKey:  "Failed to load image from \(imagePath.path)"])
-        }
-        
-        guard let cgImage = nsImage.cgImage(forProposedRect: nil, context: nil, hints:  nil) else {
-            throw NSError(domain: "SHARPModelRunner", code: 2,
-                         userInfo: [NSLocalizedDescriptionKey: "Failed to convert to CGImage"])
-        }
-        
-        // Create CIImage and resize
+    /// Load and preprocess a CGImage for model input
+    func preprocessImage(cgImage: CGImage) throws -> MLMultiArray {
+        // Create CIImage and resize using CIContext (cross-platform)
         let ciImage = CIImage(cgImage: cgImage)
         let context = CIContext()
-        
-        // Scale to target size
+
         let scaleX = CGFloat(inputWidth) / ciImage.extent.width
         let scaleY = CGFloat(inputHeight) / ciImage.extent.height
-        let scaledImage = ciImage.transformed(by: CGAffineTransform(scaleX: scaleX, y:  scaleY))
-        
-        // Render to bitmap
-        guard let resizedCGImage = context.createCGImage(scaledImage, from:  CGRect(x: 0, y: 0,
-                                                                                    width: inputWidth,
-                                                                                    height: inputHeight)) else {
-            throw NSError(domain: "SHARPModelRunner", code: 3,
-                         userInfo: [NSLocalizedDescriptionKey: "Failed to resize image"])
+        let scaledImage = ciImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+
+        guard
+            let resizedCGImage = context.createCGImage(
+                scaledImage, from: CGRect(x: 0, y: 0, width: inputWidth, height: inputHeight))
+        else {
+            throw NSError(
+                domain: "SHARPModelRunner", code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to resize image"])
         }
-        
+
         // Convert to MLMultiArray (1, 3, H, W) normalized to [0, 1]
-        let imageArray = try MLMultiArray(shape: [1, 3, NSNumber(value: inputHeight), NSNumber(value: inputWidth)],
-                                          dataType: .float32)
-        
+        let imageArray = try MLMultiArray(
+            shape: [1, 3, NSNumber(value: inputHeight), NSNumber(value: inputWidth)],
+            dataType: .float32)
+
         let width = resizedCGImage.width
         let height = resizedCGImage.height
         let bytesPerPixel = 4
         let bytesPerRow = bytesPerPixel * width
         var pixelData = [UInt8](repeating: 0, count: height * bytesPerRow)
-        
+
         let colorSpace = CGColorSpaceCreateDeviceRGB()
-        guard let cgContext = CGContext(data: &pixelData,
-                                        width: width,
-                                        height:  height,
-                                        bitsPerComponent: 8,
-                                        bytesPerRow: bytesPerRow,
-                                        space: colorSpace,
-                                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
-            throw NSError(domain: "SHARPModelRunner", code: 4,
-                         userInfo:  [NSLocalizedDescriptionKey: "Failed to create bitmap context"])
+        guard
+            let cgContext = CGContext(
+                data: &pixelData,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: bytesPerRow,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else {
+            throw NSError(
+                domain: "SHARPModelRunner", code: 4,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to create bitmap context"])
         }
-        
+
         cgContext.draw(resizedCGImage, in: CGRect(x: 0, y: 0, width: width, height: height))
-        
+
         // Copy pixel data to MLMultiArray in CHW format
-        // Use pointer access for better performance
         let ptr = imageArray.dataPointer.assumingMemoryBound(to: Float.self)
         let channelStride = inputHeight * inputWidth
-        
+
         for y in 0..<height {
             for x in 0..<width {
                 let pixelIndex = y * bytesPerRow + x * bytesPerPixel
                 let r = Float(pixelData[pixelIndex]) / 255.0
                 let g = Float(pixelData[pixelIndex + 1]) / 255.0
                 let b = Float(pixelData[pixelIndex + 2]) / 255.0
-                
+
                 let spatialIndex = y * inputWidth + x
                 ptr[0 * channelStride + spatialIndex] = r
                 ptr[1 * channelStride + spatialIndex] = g
                 ptr[2 * channelStride + spatialIndex] = b
             }
         }
-        
+
         return imageArray
+    }
+
+    /// Load and preprocess an image file for model input
+    func preprocessImage(at imagePath: URL) throws -> MLMultiArray {
+        #if os(macOS)
+            guard let nsImage = NSImage(contentsOf: imagePath),
+                let cgImage = nsImage.cgImage(forProposedRect: nil, context: nil, hints: nil)
+            else {
+                throw NSError(
+                    domain: "SHARPModelRunner", code: 1,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: "Failed to load image from \(imagePath.path)"
+                    ])
+            }
+            return try preprocessImage(cgImage: cgImage)
+        #else
+            guard let uiImage = UIImage(contentsOfFile: imagePath.path),
+                let cgImage = uiImage.cgImage
+            else {
+                throw NSError(
+                    domain: "SHARPModelRunner", code: 1,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: "Failed to load image from \(imagePath.path)"
+                    ])
+            }
+            return try preprocessImage(cgImage: cgImage)
+        #endif
     }
     
     /// Run inference on the model
@@ -582,184 +606,3 @@ class SHARPModelRunner {
         print("✓ Saved PLY with \(numGaussians) Gaussians to \(outputPath.path)")
     }
 }
-
-// MARK: - Command Line Argument Parsing
-
-struct CommandLineArgs {
-    let modelPath: URL
-    let imagePath: URL
-    let outputPath: URL
-    let focalLength: Float
-    let decimation: Float
-    
-    static func parse() -> CommandLineArgs?  {
-        let args = CommandLine.arguments
-        
-        var modelPath: URL? 
-        var imagePath: URL?
-        var outputPath: URL?
-        var focalLength: Float = 1536.0
-        var decimation: Float = 1.0
-        
-        var i = 1
-        while i < args.count {
-            let arg = args[i]
-            
-            switch arg {
-            case "-m", "--model":
-                i += 1
-                if i < args.count {
-                    modelPath = URL(fileURLWithPath: args[i])
-                }
-                
-            case "-i", "--input":
-                i += 1
-                if i < args.count {
-                    imagePath = URL(fileURLWithPath: args[i])
-                }
-                
-            case "-o", "--output":
-                i += 1
-                if i < args.count {
-                    outputPath = URL(fileURLWithPath:  args[i])
-                }
-                
-            case "-f", "--focal-length": 
-                i += 1
-                if i < args.count {
-                    focalLength = Float(args[i]) ?? 1536.0
-                }
-                
-            case "-d", "--decimation": 
-                i += 1
-                if i < args.count {
-                    if let value = Float(args[i]) {
-                        // Accept both percentage (0-100) and ratio (0-1)
-                        if value > 1.0 {
-                            decimation = value / 100.0
-                        } else {
-                            decimation = value
-                        }
-                        decimation = max(0.01, min(1.0, decimation))
-                    }
-                }
-                
-            case "-h", "--help": 
-                printUsage()
-                return nil
-                
-            default:
-                // Handle positional arguments for backward compatibility
-                if modelPath == nil {
-                    modelPath = URL(fileURLWithPath: arg)
-                } else if imagePath == nil {
-                    imagePath = URL(fileURLWithPath: arg)
-                } else if outputPath == nil {
-                    outputPath = URL(fileURLWithPath: arg)
-                } else if focalLength == 1536.0 {
-                    focalLength = Float(arg) ?? 1536.0
-                }
-            }
-            
-            i += 1
-        }
-        
-        guard let model = modelPath, let image = imagePath, let output = outputPath else {
-            printUsage()
-            return nil
-        }
-        
-        return CommandLineArgs(
-            modelPath: model,
-            imagePath: image,
-            outputPath: output,
-            focalLength: focalLength,
-            decimation:  decimation
-        )
-    }
-    
-    static func printUsage() {
-        let execName = CommandLine.arguments[0].components(separatedBy:  "/").last ?? "sharp_runner"
-        print("""
-        Usage: \(execName) [OPTIONS] <model> <input_image> <output.ply>
-        
-        SHARP Model Inference - Generate 3D Gaussian Splats from a single image
-        
-        Arguments:
-          model              Path to the SHARP Core ML model (.mlpackage, .mlmodel, or .mlmodelc)
-          input_image        Path to input image (PNG, JPEG, etc.)
-          output.ply         Path for output PLY file
-        
-        Options: 
-          -m, --model PATH           Path to Core ML model
-          -i, --input PATH           Path to input image
-          -o, --output PATH          Path for output PLY file
-          -f, --focal-length FLOAT   Focal length in pixels (default: 1536)
-          -d, --decimation FLOAT     Decimation ratio 0.0-1.0 or percentage 1-100 (default:  1.0 = keep all)
-                                     Example: 0.5 or 50 keeps 50% of Gaussians
-          -h, --help                 Show this help message
-        
-        Examples:
-          # Basic usage
-          \(execName) sharp.mlpackage photo.jpg output.ply
-        
-          # With focal length
-          \(execName) sharp.mlpackage photo.jpg output.ply 768
-        
-          # With decimation (keep 50% of points)
-          \(execName) -m sharp.mlpackage -i photo.jpg -o output.ply -d 0.5
-        
-          # With decimation as percentage
-          \(execName) -m sharp.mlpackage -i photo.jpg -o output.ply -d 25
-        
-        The model will be automatically compiled on first use and cached for subsequent runs.
-        Decimation keeps the most important Gaussians based on scale and opacity.
-        """)
-    }
-}
-
-// MARK:  - Main Entry Point
-
-func main() {
-    guard let args = CommandLineArgs.parse() else {
-        exit(1)
-    }
-    
-    do {
-        print("Loading SHARP model from \(args.modelPath.path)...")
-        let runner = try SHARPModelRunner(modelPath:  args.modelPath)
-        
-        print("Preprocessing image \(args.imagePath.path)...")
-        let imageArray = try runner.preprocessImage(at: args.imagePath)
-        
-        print("Running inference...")
-        let startTime = CFAbsoluteTimeGetCurrent()
-        let gaussians = try runner.predict(image: imageArray, focalLengthPx: args.focalLength)
-        let inferenceTime = CFAbsoluteTimeGetCurrent() - startTime
-        
-        print("✓ Generated \(gaussians.count) Gaussians in \(String(format: "%.2f", inferenceTime))s")
-        
-        print("Saving PLY file...")
-        try runner.savePLY(
-            gaussians: gaussians,
-            focalLengthPx: args.focalLength,
-            imageShape: (height: 1536, width: 1536),
-            to: args.outputPath,
-            decimation:  args.decimation
-        )
-        
-        print("✓ Complete!")
-        
-    } catch {
-        print("Error: \(error.localizedDescription)")
-        if let nsError = error as NSError? {
-            print("Domain: \(nsError.domain), Code: \(nsError.code)")
-            if let underlyingError = nsError.userInfo[NSUnderlyingErrorKey] as?  Error {
-                print("Underlying error: \(underlyingError)")
-            }
-        }
-        exit(1)
-    }
-}
-
-main()
