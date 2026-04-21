@@ -552,6 +552,7 @@ struct CroppedImagesView: View {
                     gaussians: tiles,
                     focalLengthPx: focalLength,
                     imageShape: imageShape,
+                    decimation: decimation,
                     to: mergedURL
                 )
             }.value

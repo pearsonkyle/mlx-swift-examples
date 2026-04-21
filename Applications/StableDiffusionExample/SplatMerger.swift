@@ -12,10 +12,15 @@ enum SplatMerger {
     /// `(i + 0.5) · 2π / N` radians around +Y. Mirrors the attribute layout
     /// produced by `SHARPModelRunner.savePLY` so MetalSplatter's SplatIO
     /// reader treats it identically.
+    ///
+    /// `decimation` is a keep-ratio in `(0, 1]`; values below 1 run the same
+    /// importance-weighted selection used by `SHARPModelRunner.savePLY`, so
+    /// the merged file stays consistent with the per-tile PLYs written beside it.
     static func mergePanorama360(
         gaussians: [Gaussians3D],
         focalLengthPx: Float,
         imageShape: (height: Int, width: Int),
+        decimation: Float = 1.0,
         to outputURL: URL
     ) throws {
         let n = gaussians.count
@@ -25,7 +30,13 @@ enum SplatMerger {
                 userInfo: [NSLocalizedDescriptionKey: "No tiles to merge"])
         }
 
-        let totalCount = gaussians.reduce(0) { $0 + $1.count }
+        let clampedDecimation = min(max(decimation, 0.0001), 1.0)
+        let keepIndicesPerTile: [[Int]] = gaussians.map { tile in
+            clampedDecimation < 1.0
+                ? tile.decimationIndices(keepRatio: clampedDecimation)
+                : Array(0..<tile.count)
+        }
+        let totalCount = keepIndicesPerTile.reduce(0) { $0 + $1.count }
         let imageWidth = imageShape.width
         let imageHeight = imageShape.height
 
@@ -96,14 +107,13 @@ enum SplatMerger {
             let qyw = cos(halfTheta)
             let qyy = sin(halfTheta)
 
-            let count = tile.count
             let meanPtr = tile.meanVectors.dataPointer.assumingMemoryBound(to: Float.self)
             let scalePtr = tile.singularValues.dataPointer.assumingMemoryBound(to: Float.self)
             let quatPtr = tile.quaternions.dataPointer.assumingMemoryBound(to: Float.self)
             let colorPtr = tile.colors.dataPointer.assumingMemoryBound(to: Float.self)
             let opacityPtr = tile.opacities.dataPointer.assumingMemoryBound(to: Float.self)
 
-            for j in 0..<count {
+            for j in keepIndicesPerTile[i] {
                 // Position: rotate around +Y by θ.
                 let x0 = meanPtr[j * 3 + 0]
                 let y0 = meanPtr[j * 3 + 1]
