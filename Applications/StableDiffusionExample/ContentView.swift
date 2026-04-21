@@ -204,6 +204,7 @@ struct ContentView: View {
     }
 
     // Document picker delegate for iOS/visionOS
+    #if !os(macOS)
     class DocumentPickerDelegate: NSObject, UIDocumentPickerDelegate {
         private let onFileSelected: (URL) -> Void
         
@@ -217,6 +218,7 @@ struct ContentView: View {
             }
         }
     }
+    #endif
     // MARK: - Generation
 
     private func generate() {
