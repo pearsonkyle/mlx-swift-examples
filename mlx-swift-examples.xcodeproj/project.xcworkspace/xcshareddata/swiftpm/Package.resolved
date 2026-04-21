@@ -20,6 +20,15 @@
       }
     },
     {
+      "identity" : "metalsplatter",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/scier/MetalSplatter",
+      "state" : {
+        "revision" : "71ff248e3016ac43c0a9271e322538421b28c360",
+        "version" : "1.0.1"
+      }
+    },
+    {
       "identity" : "mlx-swift-lm",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/ml-explore/mlx-swift-lm",
@@ -89,6 +98,15 @@
       "state" : {
         "revision" : "5f613358148239d0292c0cef674a3c2314737f9e",
         "version" : "2.4.1"
+      }
+    },
+    {
+      "identity" : "spz-swift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/scier/spz-swift.git",
+      "state" : {
+        "revision" : "e2410c91bceba2539c11157ad92e488ef6e16416",
+        "version" : "2.1.0"
       }
     },
     {
