@@ -16,8 +16,10 @@ import Foundation
 
 // MARK: - Gaussians3D Structure
 
-/// Represents the output of the SHARP model - a collection of 3D Gaussians
-struct Gaussians3D {
+/// Represents the output of the SHARP model - a collection of 3D Gaussians.
+/// The underlying `MLMultiArray`s are produced once and then read-only, so the
+/// struct can be handed across concurrency domains without locking.
+struct Gaussians3D: @unchecked Sendable {
     let meanVectors: MLMultiArray      // Shape: (1, N, 3) - 3D positions
     let singularValues: MLMultiArray   // Shape: (1, N, 3) - scales
     let quaternions: MLMultiArray      // Shape: (1, N, 4) - rotations

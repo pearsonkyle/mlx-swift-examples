@@ -36,6 +36,9 @@
 		C36BEFF22BC32A9A002D4AFE /* Progress in Frameworks */ = {isa = PBXBuildFile; productRef = C36BEFF12BC32A9A002D4AFE /* Progress */; };
 		C397C59C2B62C6D0004B084D /* ArgumentParser in Frameworks */ = {isa = PBXBuildFile; productRef = C397C59B2B62C6D0004B084D /* ArgumentParser */; };
 		C3E7D94D2CF6C9B20056C095 /* StableDiffusion in Frameworks */ = {isa = PBXBuildFile; productRef = C3E7D94C2CF6C9B20056C095 /* StableDiffusion */; };
+		DC0010012F00000000000001 /* MetalSplatter in Frameworks */ = {isa = PBXBuildFile; productRef = DC0010042F00000000000004 /* MetalSplatter */; };
+		DC0010022F00000000000002 /* SplatIO in Frameworks */ = {isa = PBXBuildFile; productRef = DC0010052F00000000000005 /* SplatIO */; };
+		DC0010032F00000000000003 /* PLYIO in Frameworks */ = {isa = PBXBuildFile; productRef = DC0010062F00000000000006 /* PLYIO */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -344,8 +347,13 @@
 				StableDiffusionExample/Assets.xcassets,
 				StableDiffusionExample/ContentView.swift,
 				StableDiffusionExample/CroppedImagesView.swift,
+				StableDiffusionExample/MetalKitSceneRenderer.swift,
+				StableDiffusionExample/MetalKitSceneView.swift,
 				"StableDiffusionExample/Preview Content/Preview Assets.xcassets",
 				StableDiffusionExample/Sharp.swift,
+				StableDiffusionExample/SplatMerger.swift,
+				StableDiffusionExample/SplatStore.swift,
+				StableDiffusionExample/SplatViewerView.swift,
 				StableDiffusionExample/StableDiffusionExampleApp.swift,
 			);
 			target = C36BF0002BC5CE55002D4AFE /* StableDiffusionExample */;
@@ -461,6 +469,9 @@
 			buildActionMask = 2147483647;
 			files = (
 				C32A18092CFFD1B70092A5B6 /* StableDiffusion in Frameworks */,
+				DC0010012F00000000000001 /* MetalSplatter in Frameworks */,
+				DC0010022F00000000000002 /* SplatIO in Frameworks */,
+				DC0010032F00000000000003 /* PLYIO in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -920,6 +931,7 @@
 				C397D8F22CD2F60B00B87EE2 /* XCLocalSwiftPackageReference "Libraries/.." */,
 				C32A18442D00E13E0092A5B6 /* XCRemoteSwiftPackageReference "mlx-swift" */,
 				C32AA12E2EB97625002914C6 /* XCRemoteSwiftPackageReference "mlx-swift-lm" */,
+				DC0010072F00000000000007 /* XCRemoteSwiftPackageReference "MetalSplatter" */,
 			);
 			productRefGroup = C39273752B606A0A00368D5D /* Products */;
 			projectDirPath = "";
@@ -2261,11 +2273,11 @@
 				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphonesimulator*]" = UIStatusBarStyleDefault;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				IPHONEOS_DEPLOYMENT_TARGET = 17.2;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
-				MACOSX_DEPLOYMENT_TARGET = 14.2;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 1.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
@@ -2349,11 +2361,11 @@
 				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphonesimulator*]" = UIStatusBarStyleDefault;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				IPHONEOS_DEPLOYMENT_TARGET = 17.2;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
-				MACOSX_DEPLOYMENT_TARGET = 14.2;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 1.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
@@ -3260,6 +3272,14 @@
 				minimumVersion = 1.4.0;
 			};
 		};
+		DC0010072F00000000000007 /* XCRemoteSwiftPackageReference "MetalSplatter" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/scier/MetalSplatter";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.0.1;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -3397,6 +3417,21 @@
 			isa = XCSwiftPackageProductDependency;
 			package = C397D8F22CD2F60B00B87EE2 /* XCLocalSwiftPackageReference "Libraries/.." */;
 			productName = StableDiffusion;
+		};
+		DC0010042F00000000000004 /* MetalSplatter */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = DC0010072F00000000000007 /* XCRemoteSwiftPackageReference "MetalSplatter" */;
+			productName = MetalSplatter;
+		};
+		DC0010052F00000000000005 /* SplatIO */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = DC0010072F00000000000007 /* XCRemoteSwiftPackageReference "MetalSplatter" */;
+			productName = SplatIO;
+		};
+		DC0010062F00000000000006 /* PLYIO */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = DC0010072F00000000000007 /* XCRemoteSwiftPackageReference "MetalSplatter" */;
+			productName = PLYIO;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
