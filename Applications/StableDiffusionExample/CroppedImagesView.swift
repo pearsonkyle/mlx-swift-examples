@@ -39,7 +39,7 @@ class GaussianSplatEvaluator {
         isRunning = true
         errorMessage = nil
         progressText = "Initializing..."
-        Task { @MainActor in
+        Task {
             await doRun(
                 cgImage: cgImage,
                 modelPath: modelPath,
@@ -51,6 +51,35 @@ class GaussianSplatEvaluator {
         }
     }
 
+    /// Run SHARP on each item sequentially; manages isRunning state.
+    /// Returns the output URLs that were successfully written.
+    func runBatch(
+        items: [(cgImage: CGImage, outputURL: URL)],
+        modelPath: String,
+        focalLength: Float,
+        decimation: Float
+    ) async -> [URL] {
+        isRunning = true
+        errorMessage = nil
+        var results: [URL] = []
+        for (cgImage, outputURL) in items {
+            guard errorMessage == nil else { break }
+            await doRunSingle(
+                cgImage: cgImage,
+                modelPath: modelPath,
+                focalLength: focalLength,
+                decimation: decimation,
+                outputURL: outputURL
+            )
+            if errorMessage == nil {
+                results.append(outputURL)
+            }
+        }
+        isRunning = false
+        progressText = nil
+        return results
+    }
+
     private func doRun(
         cgImage: CGImage,
         modelPath: String,
@@ -58,6 +87,25 @@ class GaussianSplatEvaluator {
         decimation: Float,
         outputURL: URL
     ) async {
+        await doRunSingle(
+            cgImage: cgImage,
+            modelPath: modelPath,
+            focalLength: focalLength,
+            decimation: decimation,
+            outputURL: outputURL
+        )
+        progressText = nil
+        isRunning = false
+    }
+
+    private func doRunSingle(
+        cgImage: CGImage,
+        modelPath: String,
+        focalLength: Float,
+        decimation: Float,
+        outputURL: URL
+    ) async {
+        guard errorMessage == nil else { return }
         do {
             progressText = "Running SHARP inference..."
             try await Task.detached(priority: .userInitiated) {
@@ -72,11 +120,7 @@ class GaussianSplatEvaluator {
                     decimation: decimation
                 )
             }.value
-            progressText = nil
-            isRunning = false
         } catch {
-            progressText = nil
-            isRunning = false
             errorMessage = "SHARP error: \(error.localizedDescription)"
         }
     }
@@ -350,47 +394,35 @@ struct CroppedImagesView: View {
             panel.prompt = "Export Here"
             guard panel.runModal() == .OK, let folder = panel.url else { return }
 
-            let items = croppedItems
-            evaluator.isRunning = true
-            evaluator.errorMessage = nil
-            Task { @MainActor in
-                for item in items {
-                    guard evaluator.errorMessage == nil else { break }
-                    let url = folder.appendingPathComponent("splat_tile_\(item.id + 1).ply")
-                    await evaluator.doRunBatch(
-                        cgImage: item.cgImage,
-                        modelPath: sharpModelPath,
-                        focalLength: focalLength,
-                        decimation: decimation,
-                        outputURL: url
-                    )
-                }
-                evaluator.isRunning = false
-                evaluator.progressText = nil
+            let batchItems = croppedItems.map { item in
+                (
+                    cgImage: item.cgImage,
+                    outputURL: folder.appendingPathComponent("splat_tile_\(item.id + 1).ply")
+                )
+            }
+            Task {
+                await evaluator.runBatch(
+                    items: batchItems,
+                    modelPath: sharpModelPath,
+                    focalLength: focalLength,
+                    decimation: decimation
+                )
             }
         #else
-            let items = croppedItems
-            evaluator.isRunning = true
-            evaluator.errorMessage = nil
-            Task { @MainActor in
-                var urls: [URL] = []
-                for item in items {
-                    guard evaluator.errorMessage == nil else { break }
-                    let url = FileManager.default.temporaryDirectory
-                        .appendingPathComponent("splat_tile_\(item.id + 1).ply")
-                    await evaluator.doRunBatch(
-                        cgImage: item.cgImage,
-                        modelPath: sharpModelPath,
-                        focalLength: focalLength,
-                        decimation: decimation,
-                        outputURL: url
-                    )
-                    if FileManager.default.fileExists(atPath: url.path) {
-                        urls.append(url)
-                    }
-                }
-                evaluator.isRunning = false
-                evaluator.progressText = nil
+            let tmpDir = FileManager.default.temporaryDirectory
+            let batchItems = croppedItems.map { item in
+                (
+                    cgImage: item.cgImage,
+                    outputURL: tmpDir.appendingPathComponent("splat_tile_\(item.id + 1).ply")
+                )
+            }
+            Task {
+                let urls = await evaluator.runBatch(
+                    items: batchItems,
+                    modelPath: sharpModelPath,
+                    focalLength: focalLength,
+                    decimation: decimation
+                )
                 if !urls.isEmpty { shareItems(urls) }
             }
         #endif
@@ -449,38 +481,6 @@ struct CroppedImagesView: View {
             }
         }
     #endif
-}
-
-// MARK: - GaussianSplatEvaluator batch helper
-
-extension GaussianSplatEvaluator {
-    /// Run a single SHARP inference step as part of a batch (does not set isRunning).
-    func doRunBatch(
-        cgImage: CGImage,
-        modelPath: String,
-        focalLength: Float,
-        decimation: Float,
-        outputURL: URL
-    ) async {
-        guard errorMessage == nil else { return }
-        do {
-            progressText = "Running SHARP on tile..."
-            try await Task.detached(priority: .userInitiated) {
-                let runner = try SHARPModelRunner(modelPath: URL(filePath: modelPath))
-                let imageArray = try runner.preprocessImage(cgImage: cgImage)
-                let gaussians = try runner.predict(image: imageArray, focalLengthPx: focalLength)
-                try runner.savePLY(
-                    gaussians: gaussians,
-                    focalLengthPx: focalLength,
-                    imageShape: (height: runner.inputHeight, width: runner.inputWidth),
-                    to: outputURL,
-                    decimation: decimation
-                )
-            }.value
-        } catch {
-            errorMessage = "SHARP error: \(error.localizedDescription)"
-        }
-    }
 }
 
 // MARK: - CroppedImageCard

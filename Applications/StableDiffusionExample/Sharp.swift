@@ -105,6 +105,9 @@ func inverseSigmoid(_ x: Float) -> Float {
 
 // MARK: - SHARP Model Wrapper
 
+/// Runner for the SHARP Core ML model. Instances are not shared across concurrent tasks;
+/// each `Task.detached` in ``GaussianSplatEvaluator`` creates its own runner, so
+/// `@unchecked Sendable` is safe here.
 final class SHARPModelRunner: @unchecked Sendable {
     private let model: MLModel
     let inputHeight: Int
