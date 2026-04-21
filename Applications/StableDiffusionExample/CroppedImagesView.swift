@@ -239,7 +239,7 @@ struct CroppedImagesView: View {
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
             } else {
-                Text("Tap "Crop Panorama" to slice the panorama into individual tiles.")
+                Text("Tap 'Crop Panorama' to slice the panorama into individual tiles.")
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                 Button("Crop Panorama") { cropPanorama() }
@@ -273,8 +273,12 @@ struct CroppedImagesView: View {
         guard let src = panoramaImage else { return }
         let tileWidth = src.width / numTiles
         guard tileWidth > 0 else { return }
+        // Use a square aspect ratio: side = min(tileWidth, imageHeight),
+        // centered vertically within the panorama.
+        let side = min(tileWidth, src.height)
+        let yOffset = (src.height - side) / 2
         croppedItems = (0..<numTiles).compactMap { i in
-            let rect = CGRect(x: i * tileWidth, y: 0, width: tileWidth, height: src.height)
+            let rect = CGRect(x: i * tileWidth, y: yOffset, width: side, height: side)
             guard let tile = src.cropping(to: rect) else { return nil }
             return CroppedImageItem(id: i, cgImage: tile)
         }
@@ -317,15 +321,21 @@ struct CroppedImagesView: View {
 
     // MARK: - SHARP Model Browser
 
+    fileprivate static let sharpModelExtensions: Set<String> = ["mlpackage", "mlmodel", "mlmodelc"]
+
     func browseForSHARPModel() {
         #if os(macOS)
             let panel = NSOpenPanel()
             panel.title = "Select SHARP Core ML Model"
-            panel.allowedContentTypes =
-                ["mlpackage", "mlmodel", "mlmodelc"].compactMap { UTType(filenameExtension: $0) }
+            // .mlpackage is a directory bundle without a registered UTType,
+            // so allowedContentTypes won't match it. Instead we allow
+            // directories and use a delegate to filter by extension.
             panel.canChooseDirectories = true
             panel.canChooseFiles = true
             panel.allowsMultipleSelection = false
+            panel.treatsFilePackagesAsDirectories = false
+            let panelDelegate = SHARPModelPanelDelegate()
+            panel.delegate = panelDelegate
             if panel.runModal() == .OK, let url = panel.url {
                 sharpModelPath = url.path(percentEncoded: false)
             }
@@ -482,6 +492,29 @@ struct CroppedImagesView: View {
         }
     #endif
 }
+
+// MARK: - SHARPModelPanelDelegate
+
+#if os(macOS)
+    /// Filters NSOpenPanel to only enable Core ML model bundles (.mlpackage, .mlmodel, .mlmodelc).
+    class SHARPModelPanelDelegate: NSObject, NSOpenSavePanelDelegate {
+        func panel(_ sender: Any, shouldEnable url: URL) -> Bool {
+            // Always enable directories so the user can navigate into them,
+            // but only allow selection of items with a matching extension.
+            let ext = url.pathExtension.lowercased()
+            if CroppedImagesView.sharpModelExtensions.contains(ext) {
+                return true
+            }
+            // Enable plain directories for navigation
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue
+            {
+                return true
+            }
+            return false
+        }
+    }
+#endif
 
 // MARK: - CroppedImageCard
 
