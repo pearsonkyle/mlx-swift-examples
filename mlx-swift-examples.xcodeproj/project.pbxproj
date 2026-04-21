@@ -773,6 +773,12 @@
 			dependencies = (
 			);
 			name = StableDiffusionExample;
+			packageProductDependencies = (
+				C32A18082CFFD1B70092A5B6 /* StableDiffusion */,
+				DC0010042F00000000000004 /* MetalSplatter */,
+				DC0010052F00000000000005 /* SplatIO */,
+				DC0010062F00000000000006 /* PLYIO */,
+			);
 			productName = StableDiffusionEval;
 			productReference = C36BF0012BC5CE55002D4AFE /* StableDiffusionExample.app */;
 			productType = "com.apple.product-type.application";
