@@ -7,6 +7,8 @@ import MLXNN
 
 // port of https://github.com/ml-explore/mlx-examples/blob/main/stable_diffusion/stable_diffusion/__init__.py
 
+// Lora.swift is part of this same module (StableDiffusion)
+
 /// Iterator that produces latent images.
 ///
 /// Created by:
@@ -55,6 +57,277 @@ public struct DenoiseIterator: Sequence, IteratorProtocol {
             xt: xt, t: t, tPrev: tPrev, conditioning: conditioning, cfgWeight: cfgWeight,
             textTime: textTime)
         return xt
+    }
+}
+
+// MARK: - Seamless Tiling via Conv2d Replacement
+
+/// A Conv2d subclass that applies circular (seamless) padding instead of zero padding.
+///
+/// This mirrors the Python approach from `sdxl_lightning.py` where every Conv2d layer
+/// in the UNet and VAE decoder has its `_conv_forward` patched to use circular padding
+/// on the configured axes.
+///
+/// For seamless 360° panoramas, X-axis circular padding makes the left and right edges
+/// wrap around, eliminating visible seams.
+///
+/// Input is expected in NHWC layout: [batch, height, width, channels].
+class SeamlessConv2d: Conv2d {
+
+    let tileX: Bool
+    let tileY: Bool
+    let originalPaddingH: Int
+    let originalPaddingW: Int
+
+    /// Create a SeamlessConv2d from an existing Conv2d's configuration.
+    ///
+    /// - Parameters:
+    ///   - from: The original Conv2d to take weight/bias/stride/dilation/groups from
+    ///   - tileX: Whether to use circular padding on the width (X) axis
+    ///   - tileY: Whether to use circular padding on the height (Y) axis
+    init(from conv: Conv2d, tileX: Bool = true, tileY: Bool = false) {
+        self.tileX = tileX
+        self.tileY = tileY
+        self.originalPaddingH = conv.padding.0
+        self.originalPaddingW = conv.padding.1
+
+        // Initialize the parent Conv2d with padding=0 since we handle padding manually.
+        // We use a dummy init and then overwrite the weight/bias via update(parameters:).
+        let outputChannels = conv.weight.dim(0)
+        let kernelH = conv.weight.dim(1)
+        let kernelW = conv.weight.dim(2)
+        let inputChannels = conv.weight.dim(3) * conv.groups
+
+        super.init(
+            inputChannels: inputChannels,
+            outputChannels: outputChannels,
+            kernelSize: IntOrPair((kernelH, kernelW)),
+            stride: IntOrPair(conv.stride),
+            padding: 0,  // We apply padding ourselves
+            dilation: IntOrPair(conv.dilation),
+            groups: conv.groups,
+            bias: conv.bias != nil
+        )
+
+        // Copy the actual trained weights from the original Conv2d
+        var params = [(String, MLXArray)]()
+        params.append(("weight", conv.weight))
+        if let bias = conv.bias {
+            params.append(("bias", bias))
+        }
+        try! self.update(
+            parameters: ModuleParameters.unflattened(params), verify: .none)
+    }
+
+    override func callAsFunction(_ x: MLXArray) -> MLXArray {
+        var input = x
+        let padH = originalPaddingH
+        let padW = originalPaddingW
+
+        // Apply asymmetric padding matching the Python reference:
+        //   if tile_x and tile_y:
+        //       F.pad(input, (pad_w, pad_w, pad_h, pad_h), mode="circular")
+        //   elif tile_x:
+        //       F.pad(input, (pad_w, pad_w, 0, 0), mode="circular")
+        //       F.pad(input, (0, 0, pad_h, pad_h), mode="constant", value=0)
+        //   elif tile_y:
+        //       F.pad(input, (0, 0, pad_h, pad_h), mode="circular")
+        //       F.pad(input, (pad_w, pad_w, 0, 0), mode="constant", value=0)
+
+        // Width (X-axis) padding — NHWC layout, axis 2 is width
+        if padW > 0 {
+            if tileX {
+                let W = input.dim(2)
+                let leftWrap = input[0..., 0..., (W - padW)..., 0...]
+                let rightWrap = input[0..., 0..., ..<padW, 0...]
+                input = concatenated([leftWrap, input, rightWrap], axis: 2)
+            } else {
+                input = padded(input, widths: [[0, 0], [0, 0], [padW, padW], [0, 0]])
+            }
+        }
+
+        // Height (Y-axis) padding — NHWC layout, axis 1 is height
+        if padH > 0 {
+            if tileY {
+                let H = input.dim(1)
+                let topWrap = input[0..., (H - padH)..., 0..., 0...]
+                let bottomWrap = input[0..., ..<padH, 0..., 0...]
+                input = concatenated([topWrap, input, bottomWrap], axis: 1)
+            } else {
+                input = padded(input, widths: [[0, 0], [padH, padH], [0, 0], [0, 0]])
+            }
+        }
+
+        // Run conv2d with padding=0 (padding was already applied above)
+        var y = conv2d(
+            input, weight, stride: .init(stride), padding: .init((0, 0)),
+            dilation: .init(dilation), groups: groups)
+        if let bias {
+            y = y + bias
+        }
+        return y
+    }
+}
+
+/// Enable seamless tiling on a model by replacing all Conv2d layers that have
+/// non-zero padding with ``SeamlessConv2d`` instances.
+///
+/// This walks the entire module tree and replaces Conv2d layers in-place,
+/// matching the Python approach where every Conv2d's `_conv_forward` is patched.
+///
+/// Conv2d layers with zero padding are left unchanged (they don't need wrapping).
+///
+/// - Parameters:
+///   - model: The model to patch (e.g. UNet or VAE decoder)
+///   - tileX: Whether to enable circular padding on the X (width) axis
+///   - tileY: Whether to enable circular padding on the Y (height) axis
+func enableSeamlessTiling(_ model: Module, tileX: Bool = true, tileY: Bool = false) {
+    // Walk every module in the tree
+    let allModules = model.namedModules()
+
+    for (_, module) in allModules {
+        // Look at each module's direct children for Conv2d instances
+        let children = module.children()
+        var replacements = ModuleChildren()
+        var hasReplacements = false
+
+        for (key, child) in children.flattened() {
+            if let childConv = child as? Conv2d,
+               !(childConv is SeamlessConv2d),  // Don't double-wrap
+               (childConv.padding.0 > 0 || childConv.padding.1 > 0)
+            {
+                let seamless = SeamlessConv2d(from: childConv, tileX: tileX, tileY: tileY)
+                replacements[key] = .value(seamless)
+                hasReplacements = true
+            }
+        }
+
+        if hasReplacements {
+            // update(modules:) requires @ModuleInfo on the property
+            try? module.update(modules: replacements, verify: .none)
+        }
+    }
+}
+
+/// Disable seamless tiling on a model by replacing all ``SeamlessConv2d`` layers
+/// back to standard Conv2d instances.
+///
+/// This restores the original zero-padding behavior.
+///
+/// - Parameter model: The model to restore
+func disableSeamlessTiling(_ model: Module) {
+    let allModules = model.namedModules()
+
+    for (_, module) in allModules {
+        let children = module.children()
+        var replacements = ModuleChildren()
+        var hasReplacements = false
+
+        for (key, child) in children.flattened() {
+            if let seamlessConv = child as? SeamlessConv2d {
+                // Create a standard Conv2d with the original padding restored
+                let outputChannels = seamlessConv.weight.dim(0)
+                let kernelH = seamlessConv.weight.dim(1)
+                let kernelW = seamlessConv.weight.dim(2)
+                let inputChannels = seamlessConv.weight.dim(3) * seamlessConv.groups
+
+                let restored = Conv2d(
+                    inputChannels: inputChannels,
+                    outputChannels: outputChannels,
+                    kernelSize: IntOrPair((kernelH, kernelW)),
+                    stride: IntOrPair(seamlessConv.stride),
+                    padding: IntOrPair((seamlessConv.originalPaddingH, seamlessConv.originalPaddingW)),
+                    dilation: IntOrPair(seamlessConv.dilation),
+                    groups: seamlessConv.groups,
+                    bias: seamlessConv.bias != nil
+                )
+
+                var params = [(String, MLXArray)]()
+                params.append(("weight", seamlessConv.weight))
+                if let bias = seamlessConv.bias {
+                    params.append(("bias", bias))
+                }
+                let verify = Module.VerifyUpdate.none
+                try! restored.update(
+                    parameters: ModuleParameters.unflattened(params), verify: verify)
+
+                replacements[key] = .value(restored)
+                hasReplacements = true
+            }
+        }
+
+        if hasReplacements {
+            try? module.update(modules: replacements, verify: .none)
+        }
+    }
+}
+
+// MARK: - Configuration Extensions
+
+extension StableDiffusionConfiguration {
+    
+    /// Create a configuration for loading from local .safetensors files
+    ///
+    /// - Parameters:
+    ///   - paths: Local model file paths (checkpoint, optional VAE, optional LoRA)
+    ///   - defaultParameters: Function returning default evaluation parameters
+    /// - Returns: A configuration that can load from local files
+    public static func localModel(
+        _ paths: LocalModelPaths,
+        defaultParameters: @escaping () -> EvaluateParameters = { EvaluateParameters(cfgWeight: 2.0, steps: 4) }
+    ) -> StableDiffusionConfiguration {
+        // Use a placeholder ID for local models
+        let id = "local:\(paths.checkpoint.lastPathComponent)"
+        
+        return StableDiffusionConfiguration(
+            id: id,
+            files: [:], // No HF hub files needed
+            defaultParameters: defaultParameters,
+            factory: { hub, config, loadConfig in
+                try loadStableDiffusionXLFromSingleFile(
+                    url: paths.checkpoint,
+                    vaeUrl: paths.vae,
+                    hub: hub,
+                    configuration: config,
+                    dType: loadConfig.dType
+                )
+            }
+        )
+    }
+    
+    /// Create a configuration with LoRA support
+    ///
+    /// - Parameters:
+    ///   - baseConfiguration: The base configuration to extend
+    ///   - loraUrl: URL to the LoRA weights file
+    ///   - scale: Scale factor for LoRA (default 1.0)
+    public func withLora(_ loraUrl: URL, scale: Float = 1.0) -> StableDiffusionConfiguration {
+        var config = self
+        // Store LoRA info in metadata (would need to extend configuration)
+        return config
+    }
+}
+
+// MARK: - Convenience Factory for Local Models
+
+extension ModelContainer {
+
+    /// Create a ``ModelContainer`` that supports ``TextToImageGenerator`` from local files
+    ///
+    /// - Parameters:
+    ///   - paths: Local model file paths
+    ///   - loadConfiguration: Configuration for loading weights
+    public static func createLocalTextToImageGenerator(
+        paths: LocalModelPaths,
+        loadConfiguration: LoadConfiguration = .init()
+    ) throws -> ModelContainer<TextToImageGenerator> {
+        let sdConfiguration = StableDiffusionConfiguration.localModel(paths)
+
+        if let model = try sdConfiguration.textToImageGenerator(configuration: loadConfiguration) {
+            return .init(model: model)
+        } else {
+            throw ModelContainerError.unableToCreate("local model", "TextToImageGenerator")
+        }
     }
 }
 
@@ -362,6 +635,30 @@ open class StableDiffusionXL: StableDiffusion, TextToImageGenerator, ImageToImag
         try super.init(
             hub: hub, configuration: configuration, dType: dType,
             diffusionConfiguration: diffusionConfiguration, sampler: sampler)
+    }
+
+    /// Initialize with pre-built components (for loading from local files).
+    ///
+    /// This initializer accepts all model components directly, bypassing the
+    /// HuggingFace Hub file resolution. Used by ``loadStableDiffusionXLFromSingleFile()``.
+    internal init(
+        hub: HubApi, configuration: StableDiffusionConfiguration, dType: DType,
+        diffusionConfiguration: DiffusionConfiguration,
+        unet: UNetModel,
+        textEncoder: CLIPTextModel,
+        autoencoder: Autoencoder,
+        sampler: SimpleEulerSampler,
+        tokenizer: CLIPTokenizer,
+        textEncoder2: CLIPTextModel,
+        tokenizer2: CLIPTokenizer
+    ) throws {
+        self.textEncoder2 = textEncoder2
+        self.tokenizer2 = tokenizer2
+        try super.init(
+            hub: hub, configuration: configuration, dType: dType,
+            diffusionConfiguration: diffusionConfiguration,
+            unet: unet, textEncoder: textEncoder,
+            autoencoder: autoencoder, sampler: sampler, tokenizer: tokenizer)
     }
 
     open override func ensureLoaded() {

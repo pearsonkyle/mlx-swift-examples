@@ -48,8 +48,8 @@ class Attention: Module, UnaryLayer {
 class EncoderDecoderBlock2D: Module, UnaryLayer {
 
     let resnets: [ResnetBlock2D]
-    let downsample: Conv2d?
-    let upsample: Conv2d?
+    @ModuleInfo var downsample: Conv2d?
+    @ModuleInfo var upsample: Conv2d?
 
     init(
         inputChannels: Int, outputChannels: Int, numLayers: Int = 1, resnetGroups: Int = 32,

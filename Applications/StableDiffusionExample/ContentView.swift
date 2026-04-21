@@ -3,13 +3,39 @@
 import MLX
 import StableDiffusion
 import SwiftUI
+import UniformTypeIdentifiers
+#if !os(macOS)
+import UIKit
+#endif
+// MARK: - Model Source
+
+/// Selects between the default SDXL Turbo preset and a custom local model.
+enum ModelSource: String, CaseIterable {
+    case sdxlTurbo = "SDXL Turbo"
+    case localModel = "Local Model (Panorama)"
+}
 
 struct ContentView: View {
 
-    @State var prompt = "dismal swamp, dense, very dark, realistic"
-    @State var negativePrompt = ""
+    @State var prompt = "Glowing mushrooms around pyramids amidst a cosmic backdrop, equirectangular, 360 panorama, cinematic"
+    @State var negativePrompt =
+        "boring, text, signature, watermark, low quality, bad quality, grainy, blurry, long neck, closed eyes"
     @State var evaluator = StableDiffusionEvaluator()
     @State var showProgress = false
+
+    // Local model file path (single merged checkpoint with LoRA baked in)
+    @State var modelSource: ModelSource = .sdxlTurbo
+    @State var checkpointPath: String = ""
+    #if !os(macOS)
+    @State var documentPickerDelegate: DocumentPickerDelegate?
+    #endif
+
+    // Panorama parameters
+    @State var outputWidth: String = "2048"
+    @State var outputHeight: String = "1024"
+    @State var steps: String = "8"
+    @State var cfgScale: String = "3.0"
+    @State var seed: String = ""
 
     var body: some View {
         VStack {
@@ -28,6 +54,19 @@ struct ContentView: View {
                     .frame(minHeight: 200)
             }
             Spacer()
+
+            // Model Source Picker
+            Picker("Model", selection: $modelSource) {
+                ForEach(ModelSource.allCases, id: \.self) { source in
+                    Text(source.rawValue).tag(source)
+                }
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal)
+
+            if modelSource == .localModel {
+                localModelSection
+            }
 
             Grid {
                 GridRow {
@@ -48,43 +87,166 @@ struct ContentView: View {
                         .disabled(evaluator.progress != nil)
                         .keyboardShortcut("r")
                 }
-                if evaluator.modelFactory.canShowProgress
-                    || evaluator.modelFactory.canUseNegativeText
-                {
-                    GridRow {
-                        if evaluator.modelFactory.canUseNegativeText {
-                            TextField("negative prompt", text: $negativePrompt)
-                                .onSubmit(generate)
-                                .disabled(evaluator.progress != nil)
-                                #if os(visionOS)
-                                    .textFieldStyle(.roundedBorder)
-                                #endif
-                            Button(action: { prompt = "" }) {
-                                Label("clear", systemImage: "xmark.circle.fill").font(
-                                    .system(size: 10))
-                            }
-                            .labelStyle(.iconOnly)
-                            .buttonStyle(.plain)
-                        } else {
-                            EmptyView()
-                            EmptyView()
-                        }
 
-                        if evaluator.modelFactory.canShowProgress {
-                            Toggle("Show Progress", isOn: $showProgress)
+                GridRow {
+                    TextField("negative prompt", text: $negativePrompt)
+                        .onSubmit(generate)
+                        .disabled(evaluator.progress != nil)
+                        #if os(visionOS)
+                            .textFieldStyle(.roundedBorder)
+                        #endif
+                    Button(action: { negativePrompt = "" }) {
+                        Label("clear", systemImage: "xmark.circle.fill").font(
+                            .system(size: 10))
+                    }
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(.plain)
+
+                    if modelSource == .sdxlTurbo {
+                        Toggle("Show Progress", isOn: $showProgress)
+                    } else {
+                        EmptyView()
+                    }
+                }
+
+                if modelSource == .localModel {
+                    GridRow {
+                        HStack {
+                            Text("Size:")
+                                .foregroundStyle(.secondary)
+                            TextField("W", text: $outputWidth)
+                                .frame(width: 60)
+                            Text("×")
+                            TextField("H", text: $outputHeight)
+                                .frame(width: 60)
+                            Text("Steps:")
+                                .foregroundStyle(.secondary)
+                            TextField("Steps", text: $steps)
+                                .frame(width: 40)
+                            Text("CFG:")
+                                .foregroundStyle(.secondary)
+                            TextField("CFG", text: $cfgScale)
+                                .frame(width: 40)
+                            Text("Seed:")
+                                .foregroundStyle(.secondary)
+                            TextField("random", text: $seed)
+                                .frame(width: 80)
                         }
                     }
                 }
             }
             .frame(minWidth: 300)
+
+            if let message = evaluator.message {
+                Text(message)
+                    .foregroundStyle(.red)
+                    .font(.caption)
+            }
         }
         .padding()
     }
 
+    // MARK: - Local Model File Selection
+
+    @ViewBuilder
+    var localModelSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            fileRow(label: "Merged Checkpoint:", path: $checkpointPath, types: ["safetensors"])
+        }
+        .padding(.horizontal)
+        .font(.caption)
+    }
+
+    func fileRow(label: String, path: Binding<String>, types: [String]) -> some View {
+        HStack {
+            Text(label)
+                .frame(width: 130, alignment: .trailing)
+                .foregroundStyle(.secondary)
+            TextField("path to .safetensors", text: path)
+                .font(.caption)
+                #if os(visionOS)
+                    .textFieldStyle(.roundedBorder)
+                #endif
+            Button("Browse") {
+                #if os(macOS)
+                let panel = NSOpenPanel()
+                panel.allowedContentTypes = types.compactMap { UTType(filenameExtension: $0) }
+                panel.canChooseDirectories = false
+                panel.allowsMultipleSelection = false
+                if panel.runModal() == .OK, let url = panel.url {
+                    path.wrappedValue = url.path(percentEncoded: false)
+                }
+                #else
+                let delegate = DocumentPickerDelegate(
+                    onFileSelected: { url in
+                        path.wrappedValue = url.path(percentEncoded: false)
+                    }
+                )
+                documentPickerDelegate = delegate
+
+                let documentPicker = UIDocumentPickerViewController(
+                    forOpeningContentTypes: types.compactMap { UTType(filenameExtension: $0) },
+                    asCopy: true
+                )
+                documentPicker.allowsMultipleSelection = false
+                documentPicker.directoryURL = URL(filePath: path.wrappedValue)
+                documentPicker.delegate = delegate
+
+                if let windowScene = UIApplication.shared.connectedScenes
+                    .compactMap({ $0 as? UIWindowScene }).first,
+                   let rootVC = windowScene.keyWindow?.rootViewController {
+                    rootVC.present(documentPicker, animated: true)
+                }
+                #endif
+            }
+            .font(.caption)
+        }
+    }
+
+    // Document picker delegate for iOS/visionOS
+    #if !os(macOS)
+    class DocumentPickerDelegate: NSObject, UIDocumentPickerDelegate {
+        private let onFileSelected: (URL) -> Void
+        
+        init(onFileSelected: @escaping (URL) -> Void) {
+            self.onFileSelected = onFileSelected
+        }
+        
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            if let url = urls.first {
+                onFileSelected(url)
+            }
+        }
+    }
+    #endif
+    // MARK: - Generation
+
     private func generate() {
-        Task {
-            await evaluator.generate(
-                prompt: prompt, negativePrompt: negativePrompt, showProgress: showProgress)
+        switch modelSource {
+        case .sdxlTurbo:
+            Task {
+                await evaluator.generate(
+                    prompt: prompt, negativePrompt: negativePrompt, showProgress: showProgress)
+            }
+        case .localModel:
+            Task {
+                let w = Int(outputWidth) ?? 2048
+                let h = Int(outputHeight) ?? 1024
+                let s = Int(steps) ?? 8
+                let cfg = Float(cfgScale) ?? 3.0
+                let seedVal: UInt64? = seed.isEmpty ? nil : UInt64(seed)
+
+                await evaluator.generatePanorama(
+                    prompt: prompt,
+                    negativePrompt: negativePrompt,
+                    checkpointPath: checkpointPath,
+                    width: w,
+                    height: h,
+                    steps: s,
+                    cfgScale: cfg,
+                    seed: seedVal
+                )
+            }
         }
     }
 }
@@ -249,22 +411,17 @@ class StableDiffusionEvaluator {
         }
     }
 
+    // MARK: - SDXL Turbo Generation (Original)
+
     func generate(prompt: String, negativePrompt: String, showProgress: Bool) async {
         progress = .init(title: "Preparing", current: 0, limit: 1)
         message = nil
 
-        // The parameters that control the generation of the image. See
-        // EvaluateParameters for more information. For example, adjusting
-        // the latentSize parameter will change the size of the generated
-        // image. `imageCount` could be used to generate a gallery of
-        // images at the same time.
         let parameters = {
             var p = modelFactory.configuration.defaultParameters()
             p.prompt = prompt
             p.negativePrompt = negativePrompt
 
-            // Per measurement each step consumes memory that we want to conserve. Trade
-            // off steps (quality) for memory.
             if modelFactory.conserveMemory {
                 p.steps = 1
             }
@@ -273,33 +430,19 @@ class StableDiffusionEvaluator {
         }()
 
         do {
-            // Note: The optionals are used to discard parts of the model
-            // as it runs. This is used to conserve memory in devices
-            // with less memory.
             let container = try await modelFactory.load(reportProgress: updateProgress)
 
             try await container.performTwoStage { generator in
-                // The parameters that control the generation of the image. See
-                // EvaluateParameters for more information. For example adjusting
-                // the `latentSize` parameter will change the size of the generated
-                // image. `imageCount` could be used to generate a gallery of
-                // images at the same time.
                 var parameters = modelFactory.configuration.defaultParameters()
                 parameters.prompt = prompt
                 parameters.negativePrompt = negativePrompt
 
-                // Per measurement each step consumes memory that we want to conserve. Trade
-                // off steps (quality) for memory.
                 if modelFactory.conserveMemory {
                     parameters.steps = 1
                 }
 
-                // Generate the latent images. This is fast as it is just generating
-                // the graphs that will be evaluated below.
                 let latents: DenoiseIterator? = generator.generateLatents(parameters: parameters)
 
-                // When conserveMemory is true this will discard the first part of
-                // the model and just evaluate the decode portion.
                 return (generator.detachedDecoder(), latents)
 
             } second: { decoder, latents in
@@ -328,6 +471,103 @@ class StableDiffusionEvaluator {
         } catch {
             progress = nil
             message = "Failed: \(error)"
+        }
+    }
+
+    // MARK: - Local Model Panorama Generation (Merged Checkpoint)
+
+    func generatePanorama(
+        prompt: String,
+        negativePrompt: String,
+        checkpointPath: String,
+        width: Int,
+        height: Int,
+        steps: Int,
+        cfgScale: Float,
+        seed: UInt64?
+    ) async {
+        progress = .init(title: "Preparing local model...", current: 0, limit: 1)
+        message = nil
+
+        do {
+            // Validate checkpoint path
+            guard !checkpointPath.isEmpty else {
+                message = "Please select a merged checkpoint file"
+                progress = nil
+                return
+            }
+
+            let checkpointUrl = URL(filePath: checkpointPath)
+
+            // Step 1: Ensure SDXL Turbo is downloaded (for tokenizer/scheduler files)
+            progress = .init(title: "Downloading SDXL Turbo tokenizer files...", current: 0, limit: 100)
+            let sdxlTurbo = StableDiffusionConfiguration.presetSDXLTurbo
+            let progressCallback: @Sendable (Foundation.Progress) -> Void = { [weak self] dlProgress in
+                if dlProgress.fractionCompleted < 0.99 {
+                    self?.updateProgress(
+                        progress: .init(
+                            title: "Downloading tokenizer files",
+                            current: dlProgress.fractionCompleted * 100,
+                            limit: 100
+                        )
+                    )
+                }
+            }
+            try await sdxlTurbo.download(progressHandler: progressCallback)
+
+            // Step 2: Load the merged checkpoint (VAE + LoRA already baked in)
+            updateProgress(progress: .init(title: "Loading merged checkpoint...", current: 0, limit: 1))
+
+            let sd = try loadStableDiffusionXLFromSingleFile(
+                url: checkpointUrl,
+                dType: LoadConfiguration().dType
+            )
+
+            // Step 3: Create panorama generator
+            updateProgress(progress: .init(title: "Loading model weights...", current: 0, limit: 1))
+            let generator = PanoramaGenerator(sd, width: width, height: height)
+            generator.ensureLoaded()
+
+            // Step 4: Generate panorama
+            let parameters = PanoramaParameters(
+                prompt: prompt,
+                negativePrompt: negativePrompt,
+                width: width,
+                height: height,
+                steps: steps,
+                cfgScale: cfgScale,
+                seed: seed
+            )
+
+            let decoder = generator.detachedDecoder()
+            let latents = generator.generateLatents(parameters: parameters)
+
+            var lastXt: MLXArray?
+            for (i, xt) in latents.enumerated() {
+                lastXt = nil
+                eval(xt)
+                lastXt = xt
+
+                updateProgress(
+                    progress: .init(
+                        title: "Generating panorama",
+                        current: Double(i + 1),
+                        limit: Double(steps)
+                    )
+                )
+            }
+
+            // Step 5: Decode and display
+            if let lastXt {
+                updateProgress(progress: .init(title: "Decoding image...", current: 0, limit: 1))
+                display(decoded: decoder(lastXt))
+            }
+
+            updateProgress(progress: nil)
+
+        } catch {
+            progress = nil
+            message = "Failed: \(error.localizedDescription)"
         }
     }
 }

@@ -18,6 +18,24 @@ struct AutoencoderConfiguration: Codable {
     public var normNumGroups = 32
     public var scalingFactor: Float = 0.18215
 
+    public init(
+        inputChannels: Int = 3,
+        outputChannels: Int = 3,
+        latentChannelsIn: Int = 4,
+        blockOutChannels: [Int] = [128, 256, 512, 512],
+        layersPerBlock: Int = 2,
+        normNumGroups: Int = 32,
+        scalingFactor: Float = 0.18215
+    ) {
+        self.inputChannels = inputChannels
+        self.outputChannels = outputChannels
+        self.latentChannelsIn = latentChannelsIn
+        self.blockOutChannels = blockOutChannels
+        self.layersPerBlock = layersPerBlock
+        self.normNumGroups = normNumGroups
+        self.scalingFactor = scalingFactor
+    }
+
     enum CodingKeys: String, CodingKey {
         case inputChannels = "in_channels"
         case outputChannels = "out_channels"
