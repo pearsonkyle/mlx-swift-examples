@@ -38,6 +38,19 @@ struct ContentView: View {
     @State var seed: String = ""
 
     var body: some View {
+        TabView {
+            generationTab
+                .tabItem {
+                    Label("Generate", systemImage: "wand.and.stars")
+                }
+            CroppedImagesView(panoramaImage: evaluator.image)
+                .tabItem {
+                    Label("Gaussian Splat", systemImage: "cube.transparent")
+                }
+        }
+    }
+
+    var generationTab: some View {
         VStack {
             HStack {
                 if let progress = evaluator.progress {
