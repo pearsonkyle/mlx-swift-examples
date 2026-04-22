@@ -28,7 +28,7 @@ final class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     private var loadedURL: URL?
     private var loadTask: Task<Void, Never>?
 
-    private let inFlightSemaphore = DispatchSemaphore(value: Self.maxSimultaneousRenders)
+    private let inFlightSemaphore = DispatchSemaphore(value: MetalKitSceneRenderer.maxSimultaneousRenders)
     private var drawableSize: CGSize = .zero
 
     /// Yaw around +Y in radians. Driven by the SwiftUI view.
@@ -79,7 +79,7 @@ final class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         }
     }
 
-    private var viewport: ModelRendererViewportDescriptor {
+    private var viewport: SplatRenderer.ViewportDescriptor {
         let aspect = Float(max(drawableSize.width, 1) / max(drawableSize.height, 1))
         let projection = matrixPerspectiveRightHand(
             fovyRadians: Self.fovyRadians, aspectRatio: aspect, nearZ: 0.1, farZ: 200.0)
@@ -93,7 +93,7 @@ final class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
             width: Double(drawableSize.width), height: Double(drawableSize.height),
             znear: 0, zfar: 1)
 
-        return ModelRendererViewportDescriptor(
+        return SplatRenderer.ViewportDescriptor(
             viewport: mtlViewport,
             projectionMatrix: projection,
             viewMatrix: trans * rot * upFix,

@@ -274,7 +274,7 @@ extension StableDiffusionConfiguration {
     /// - Returns: A configuration that can load from local files
     public static func localModel(
         _ paths: LocalModelPaths,
-        defaultParameters: @escaping () -> EvaluateParameters = { EvaluateParameters(cfgWeight: 2.0, steps: 4) }
+        defaultParameters: @escaping @Sendable () -> EvaluateParameters = { EvaluateParameters(cfgWeight: 2.0, steps: 4) }
     ) -> StableDiffusionConfiguration {
         // Use a placeholder ID for local models
         let id = "local:\(paths.checkpoint.lastPathComponent)"
