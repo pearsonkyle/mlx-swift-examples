@@ -23,6 +23,9 @@ struct ContentView: View {
     @State var evaluator = StableDiffusionEvaluator()
     @State var showProgress = false
 
+    @State private var splatStore = SplatStore()
+    @State private var selectedTab: Int = 0
+
     // Local model file path (single merged checkpoint with LoRA baked in)
     @State var modelSource: ModelSource = .sdxlTurbo
     @State var checkpointPath: String = ""
@@ -38,15 +41,26 @@ struct ContentView: View {
     @State var seed: String = ""
 
     var body: some View {
-        TabView {
+        TabView(selection: $selectedTab) {
             generationTab
                 .tabItem {
                     Label("Generate", systemImage: "wand.and.stars")
                 }
-            CroppedImagesView(panoramaImage: evaluator.image)
+                .tag(0)
+            CroppedImagesView(
+                panoramaImage: evaluator.image,
+                splatStore: splatStore,
+                onRequestSplatViewer: { selectedTab = 2 }
+            )
+            .tabItem {
+                Label("Gaussian Splat", systemImage: "cube.transparent")
+            }
+            .tag(1)
+            SplatViewerView(splatStore: splatStore)
                 .tabItem {
-                    Label("Gaussian Splat", systemImage: "cube.transparent")
+                    Label("360° Viewer", systemImage: "globe")
                 }
+                .tag(2)
         }
     }
 

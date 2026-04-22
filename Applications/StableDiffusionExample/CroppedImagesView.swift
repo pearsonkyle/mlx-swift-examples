@@ -80,6 +80,55 @@ class GaussianSplatEvaluator {
         return results
     }
 
+    /// Batch runner that additionally retains the per-tile `Gaussians3D` so the
+    /// caller can merge them into a 360° scene without re-parsing the PLYs.
+    /// The inference input image size is fixed by `SHARPModelRunner` (square),
+    /// and returned via `imageShape` for the merger to embed in the merged PLY.
+    func runBatchWithGaussians(
+        items: [(cgImage: CGImage, outputURL: URL)],
+        modelPath: String,
+        focalLength: Float,
+        decimation: Float
+    ) async -> (urls: [URL], tiles: [Gaussians3D], imageShape: (height: Int, width: Int)?) {
+        isRunning = true
+        errorMessage = nil
+        var urls: [URL] = []
+        var tiles: [Gaussians3D] = []
+        var imageShape: (height: Int, width: Int)?
+
+        for (cgImage, outputURL) in items {
+            guard errorMessage == nil else { break }
+            do {
+                progressText = "Running SHARP inference..."
+                let result: (Gaussians3D, (height: Int, width: Int)) = try await Task.detached(
+                    priority: .userInitiated
+                ) { [focalLength, decimation, modelPath] in
+                    let runner = try SHARPModelRunner(modelPath: URL(filePath: modelPath))
+                    let imageArray = try runner.preprocessImage(cgImage: cgImage)
+                    let gaussians = try runner.predict(
+                        image: imageArray, focalLengthPx: focalLength)
+                    try runner.savePLY(
+                        gaussians: gaussians,
+                        focalLengthPx: focalLength,
+                        imageShape: (height: runner.inputHeight, width: runner.inputWidth),
+                        to: outputURL,
+                        decimation: decimation
+                    )
+                    return (gaussians, (height: runner.inputHeight, width: runner.inputWidth))
+                }.value
+                urls.append(outputURL)
+                tiles.append(result.0)
+                imageShape = result.1
+            } catch {
+                errorMessage = "SHARP error: \(error.localizedDescription)"
+            }
+        }
+
+        isRunning = false
+        progressText = nil
+        return (urls, tiles, imageShape)
+    }
+
     private func doRun(
         cgImage: CGImage,
         modelPath: String,
@@ -131,6 +180,8 @@ class GaussianSplatEvaluator {
 struct CroppedImagesView: View {
 
     let panoramaImage: CGImage?
+    var splatStore: SplatStore
+    var onRequestSplatViewer: (() -> Void)? = nil
 
     @State private var croppedItems: [CroppedImageItem] = []
     @State private var numTiles: Int = 4
@@ -160,7 +211,31 @@ struct CroppedImagesView: View {
                 .padding(.vertical, 2)
             }
 
+            if splatStore.isBuilding {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Merging tiles into 360° splat...").font(.caption)
+                }
+            } else if splatStore.combinedSplatURL != nil {
+                HStack(spacing: 8) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    Text("360° splat ready (\(splatStore.numTiles) tiles)")
+                        .font(.caption)
+                    Spacer()
+                    if let onRequestSplatViewer {
+                        Button("View 360° Splat", action: onRequestSplatViewer)
+                            .buttonStyle(.bordered)
+                    }
+                }
+            }
+
             if let msg = evaluator.errorMessage {
+                Text(msg)
+                    .foregroundStyle(.red)
+                    .font(.caption)
+            }
+            if let msg = splatStore.errorMessage {
                 Text(msg)
                     .foregroundStyle(.red)
                     .font(.caption)
@@ -394,6 +469,7 @@ struct CroppedImagesView: View {
         guard !croppedItems.isEmpty else { return }
         let focalLength = Float(focalLengthText) ?? 1536.0
         let decimation = Float(decimationText) ?? 1.0
+        let expectedCount = croppedItems.count
 
         #if os(macOS)
             let panel = NSOpenPanel()
@@ -411,11 +487,12 @@ struct CroppedImagesView: View {
                 )
             }
             Task {
-                await evaluator.runBatch(
+                await runBatchAndMerge(
                     items: batchItems,
-                    modelPath: sharpModelPath,
+                    parentFolder: folder,
                     focalLength: focalLength,
-                    decimation: decimation
+                    decimation: decimation,
+                    expectedCount: expectedCount
                 )
             }
         #else
@@ -427,15 +504,63 @@ struct CroppedImagesView: View {
                 )
             }
             Task {
-                let urls = await evaluator.runBatch(
+                await runBatchAndMerge(
                     items: batchItems,
-                    modelPath: sharpModelPath,
+                    parentFolder: tmpDir,
                     focalLength: focalLength,
-                    decimation: decimation
+                    decimation: decimation,
+                    expectedCount: expectedCount
                 )
-                if !urls.isEmpty { shareItems(urls) }
+                if let merged = splatStore.combinedSplatURL {
+                    shareItems([merged])
+                } else if !splatStore.tileSplatURLs.isEmpty {
+                    shareItems(splatStore.tileSplatURLs)
+                }
             }
         #endif
+    }
+
+    private func runBatchAndMerge(
+        items: [(cgImage: CGImage, outputURL: URL)],
+        parentFolder: URL,
+        focalLength: Float,
+        decimation: Float,
+        expectedCount: Int
+    ) async {
+        let result = await evaluator.runBatchWithGaussians(
+            items: items,
+            modelPath: sharpModelPath,
+            focalLength: focalLength,
+            decimation: decimation
+        )
+        splatStore.tileSplatURLs = result.urls
+        splatStore.numTiles = result.tiles.count
+        splatStore.combinedSplatURL = nil
+
+        guard result.tiles.count == expectedCount,
+              let imageShape = result.imageShape
+        else {
+            return
+        }
+
+        let mergedURL = parentFolder.appendingPathComponent("panorama_360.ply")
+        splatStore.isBuilding = true
+        do {
+            let tiles = result.tiles
+            try await Task.detached(priority: .userInitiated) {
+                try SplatMerger.mergePanorama360(
+                    gaussians: tiles,
+                    focalLengthPx: focalLength,
+                    imageShape: imageShape,
+                    decimation: decimation,
+                    to: mergedURL
+                )
+            }.value
+            splatStore.combinedSplatURL = mergedURL
+        } catch {
+            splatStore.errorMessage = "Merge error: \(error.localizedDescription)"
+        }
+        splatStore.isBuilding = false
     }
 
     // MARK: - Helpers

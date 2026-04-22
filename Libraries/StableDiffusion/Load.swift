@@ -447,7 +447,7 @@ func loadDiffusionConfiguration(hub: HubApi, configuration: StableDiffusionConfi
 // MARK: - Single File Loading
 
 /// Local model paths for loading from local .safetensors files
-public struct LocalModelPaths {
+public struct LocalModelPaths: Sendable {
     /// Path to the checkpoint file (.safetensors)
     public let checkpoint: URL
     /// Optional path to VAE file (.safetensors)

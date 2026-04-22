@@ -1,11 +1,11 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 6.0
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import PackageDescription
 
 let package = Package(
     name: "mlx-libraries",
-    platforms: [.macOS(.v14), .iOS(.v16)],
+    platforms: [.macOS(.v15), .iOS(.v18), .visionOS(.v2)],
     products: [
         .library(
             name: "MLXMNIST",
@@ -21,6 +21,7 @@ let package = Package(
             .upToNextMinor(from: "1.1.0")
         ),
         .package(url: "https://github.com/1024jp/GzipSwift", "6.0.1" ... "6.0.1"),  // Only needed by MLXMNIST
+        .package(url: "https://github.com/scier/MetalSplatter", from: "1.0.1"),
     ],
     targets: [
         .target(
